@@ -66,6 +66,10 @@ struct Args {
     /// Sort all levels by field and order (e.g. --sortall size desc)
     #[arg(long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sortall")]
     sortall: Option<Vec<String>>,
+
+    /// Number of threads to use
+    #[arg(short = 'j', long, default_value = "8", overrides_with = "threads")]
+    threads: usize,
 }
 
 fn format_size(bytes: u64) -> String {
@@ -109,13 +113,20 @@ struct Node {
 
 fn main() {
     let args = Args::parse();
+
+    // Configure Rayon thread pool
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global();
+
     let lscolors = LsColors::from_env().unwrap_or_default();
     let use_hyperlinks = args.hyperlinks;
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let root_abs = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
     
     let true_sizes = if args.truesizes {
-        calculate_truesizes(&root_path, &args)
+        calculate_truesizes(&root_abs, &args)
     } else {
         HashMap::with_hasher(FxBuildHasher::default())
     };
@@ -129,24 +140,30 @@ fn main() {
     
     println!("{}", root_path.display());
 
-    if let Some(root_node) = build_tree(&root_path, root_metadata, root_file_type, 0, &args, &true_sizes) {
+    if let Some(root_node) = build_tree(&root_abs, root_metadata, root_file_type, 0, &args, &true_sizes) {
         print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
     }
 }
 
 fn calculate_truesizes(root: &Path, args: &Args) -> HashMap<PathBuf, u64, FxBuildHasher> {
     let seen_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
-
+    
+    // Initial sizes map with hasher
+    let mut initial_sizes: HashMap<PathBuf, u64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+    
     // Seed with root metadata size
     if let Ok(m) = root.symlink_metadata() {
         seen_inodes.insert((m.dev(), m.ino()));
+        initial_sizes.insert(root.to_path_buf(), m.blocks() * 512);
     }
 
     let si = Arc::clone(&seen_inodes);
 
+    // Parallel walk and aggregate into thread-local maps
     let aggregated_sizes = WalkDir::new(root)
         .skip_hidden(!args.all)
         .follow_links(args.follow_links)
+        .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
         .into_iter()
         .par_bridge()
         .filter_map(|e| e.ok())
@@ -155,9 +172,8 @@ fn calculate_truesizes(root: &Path, args: &Args) -> HashMap<PathBuf, u64, FxBuil
             |mut local_map: HashMap<PathBuf, u64, FxBuildHasher>, entry| {
                 if let Ok(m) = entry.metadata() {
                     if si.insert((m.dev(), m.ino())) {
-                        let size = m.blocks() * 512;
                         if let Some(parent) = entry.path().parent() {
-                            *local_map.entry(parent.to_path_buf()).or_insert(0) += size;
+                            *local_map.entry(parent.to_path_buf()).or_insert(0) += m.blocks() * 512;
                         }
                     }
                 }
@@ -174,11 +190,16 @@ fn calculate_truesizes(root: &Path, args: &Args) -> HashMap<PathBuf, u64, FxBuil
             },
         );
 
+    // Merge seed and walk results
+    let mut final_sizes = initial_sizes;
+    for (path, size) in aggregated_sizes {
+        *final_sizes.entry(path).or_insert(0) += size;
+    }
+
     // Second pass: Aggregate sizes upwards
-    let mut final_sizes = aggregated_sizes;
     let mut paths: Vec<_> = final_sizes.keys().cloned().collect();
     // Sort by path component count descending to process deepest directories first
-    paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
 
     for path in paths {
         if let Some(parent) = path.parent() {
@@ -227,6 +248,7 @@ fn build_tree(
             .min_depth(1)
             .skip_hidden(!args.all)
             .follow_links(args.follow_links)
+            .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();
@@ -269,7 +291,6 @@ fn build_tree(
                     }
                 });
             } else {
-                // Not applying custom sort at this depth, use default
                 entries.sort_by(|a, b| {
                     let a_is_dir = a.file_type.is_dir();
                     let b_is_dir = b.file_type.is_dir();
