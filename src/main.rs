@@ -18,23 +18,23 @@ struct Args {
     path: Option<PathBuf>,
 
     /// Show hidden files
-    #[arg(short = 'a')]
+    #[arg(short = 'a', overrides_with = "all")]
     all: bool,
 
     /// Max depth to display
-    #[arg(short = 'L', default_value = "100")]
+    #[arg(short = 'L', default_value = "100", overrides_with = "max_depth")]
     max_depth: usize,
 
     /// Classify (add / for dirs, * for executables)
-    #[arg(short = 'F')]
+    #[arg(short = 'F', overrides_with = "classify")]
     classify: bool,
 
     /// Truncate depth 2+ entries to this value
-    #[arg(short = 'T', long, default_value = "10")]
+    #[arg(short = 'T', long, default_value = "10", overrides_with = "trunc")]
     trunc: usize,
 
     /// Enable OSC 8 hyperlinks
-    #[arg(long)]
+    #[arg(long, overrides_with = "hyperlinks")]
     hyperlinks: bool,
 }
 
