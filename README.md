@@ -44,9 +44,9 @@ tree [OPTIONS] [PATH]
 - `-L <MAX_DEPTH>`: Max depth to display (default: 100).
 - `-F`: Classify (add `/` for dirs, `@` for symlinks, `*` for executables).
 - `-T, --trunc <TRUNC>`: Truncate depth 2+ entries to this value (default: 10).
-- `--sizes`: Show file sizes.
-- `--times`: Show file modification times.
-- `--truesizes`: Show true recursive directory sizes (like `dust`).
+- `-s, --sizes`: Show file sizes.
+- `-t, --times`: Show file modification times.
+- `-S, --truesizes`: Show true recursive directory sizes (like `dust`).
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.
 - `-V, --version`: Print version.

@@ -45,15 +45,15 @@ struct Args {
     follow_links: bool,
 
     /// Show file sizes
-    #[arg(long, overrides_with = "sizes")]
+    #[arg(short = 's', long, overrides_with = "sizes")]
     sizes: bool,
 
     /// Show file modification times
-    #[arg(long, overrides_with = "times")]
+    #[arg(short = 't', long, overrides_with = "times")]
     times: bool,
 
     /// Show true recursive directory sizes
-    #[arg(long, overrides_with = "truesizes")]
+    #[arg(short = 'S', long, overrides_with = "truesizes")]
     truesizes: bool,
 }
 
