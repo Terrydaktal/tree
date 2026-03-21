@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use clap::Parser;
 use jwalk::WalkDir;
 use lscolors::LsColors;
@@ -41,9 +42,13 @@ struct Args {
     #[arg(short = 'H', long, overrides_with = "follow_links")]
     follow_links: bool,
 
-    /// Long mode (show file size)
-    #[arg(short = 'l', long, overrides_with = "long")]
-    long: bool,
+    /// Show file sizes
+    #[arg(long, overrides_with = "sizes")]
+    sizes: bool,
+
+    /// Show file modification times
+    #[arg(long, overrides_with = "times")]
+    times: bool,
 }
 
 fn format_size(bytes: u64) -> String {
@@ -62,6 +67,15 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_time(metadata: &Metadata) -> String {
+    if let Ok(mtime) = metadata.modified() {
+        let datetime: DateTime<Local> = mtime.into();
+        datetime.format("%Y-%m-%d %H:%M").to_string()
+    } else {
+        "-".to_string()
     }
 }
 
@@ -163,9 +177,14 @@ fn print_node(
     for (i, child) in node.children.iter().enumerate() {
         let is_last = i == child_count - 1 && total_count <= child_count;
         
-        if args.long {
+        if args.sizes {
             let size_str = child.metadata.as_ref().map(|m| format_size(m.len())).unwrap_or_else(|| "-".to_string());
             print!("{:>10} ", size_str);
+        }
+
+        if args.times {
+            let time_str = child.metadata.as_ref().map(|m| format_time(m)).unwrap_or_else(|| "-".to_string());
+            print!("{:>16} ", time_str);
         }
 
         // Print prefix
@@ -229,8 +248,11 @@ fn print_node(
     }
 
     if total_count > child_count {
-        if args.long {
+        if args.sizes {
             print!("{:>10} ", "");
+        }
+        if args.times {
+            print!("{:>16} ", "");
         }
         for &last in prefixes {
             if last {
