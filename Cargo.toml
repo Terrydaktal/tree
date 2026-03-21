@@ -11,6 +11,7 @@ is-terminal = "0.4.17"
 jwalk = "0.8.1"
 lscolors = "0.21.0"
 rayon = "1.11.0"
+rustc-hash = "2.1.1"
 tikv-jemallocator = "0.6.1"
 url = "2.5.8"
 

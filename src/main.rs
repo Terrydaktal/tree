@@ -1,12 +1,15 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use jwalk::WalkDir;
 use lscolors::LsColors;
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
+use std::collections::HashMap;
 use std::fs::Metadata;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use url::Url;
 
 #[cfg(not(target_env = "msvc"))]
@@ -114,7 +117,7 @@ fn main() {
     let true_sizes = if args.truesizes {
         calculate_truesizes(&root_path, &args)
     } else {
-        DashMap::new()
+        HashMap::with_hasher(FxBuildHasher::default())
     };
 
     let root_metadata = if args.follow_links {
@@ -131,34 +134,63 @@ fn main() {
     }
 }
 
-fn calculate_truesizes(root: &Path, args: &Args) -> DashMap<PathBuf, u64> {
-    let dir_sizes = DashMap::new();
-    let seen_inodes = DashSet::new();
+fn calculate_truesizes(root: &Path, args: &Args) -> HashMap<PathBuf, u64, FxBuildHasher> {
+    let seen_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
 
-    WalkDir::new(root)
+    // Seed with root metadata size
+    if let Ok(m) = root.symlink_metadata() {
+        seen_inodes.insert((m.dev(), m.ino()));
+    }
+
+    let si = Arc::clone(&seen_inodes);
+
+    let aggregated_sizes = WalkDir::new(root)
         .skip_hidden(!args.all)
         .follow_links(args.follow_links)
         .into_iter()
         .par_bridge()
         .filter_map(|e| e.ok())
-        .for_each(|entry| {
-            let metadata = entry.metadata().ok();
-            if let Some(m) = metadata {
-                let dev = m.dev();
-                let ino = m.ino();
-                if seen_inodes.insert((dev, ino)) {
-                    let size = m.blocks() * 512;
-                    let path = entry.path();
-                    let mut current = path.as_path();
-                    while let Some(parent) = current.parent() {
-                        *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
-                        if parent == root { break; }
-                        current = parent;
+        .fold(
+            || HashMap::with_hasher(FxBuildHasher::default()),
+            |mut local_map: HashMap<PathBuf, u64, FxBuildHasher>, entry| {
+                if let Ok(m) = entry.metadata() {
+                    if si.insert((m.dev(), m.ino())) {
+                        let size = m.blocks() * 512;
+                        if let Some(parent) = entry.path().parent() {
+                            *local_map.entry(parent.to_path_buf()).or_insert(0) += size;
+                        }
                     }
                 }
+                local_map
+            },
+        )
+        .reduce(
+            || HashMap::with_hasher(FxBuildHasher::default()),
+            |mut map1, map2| {
+                for (path, size) in map2 {
+                    *map1.entry(path).or_insert(0) += size;
+                }
+                map1
+            },
+        );
+
+    // Second pass: Aggregate sizes upwards
+    let mut final_sizes = aggregated_sizes;
+    let mut paths: Vec<_> = final_sizes.keys().cloned().collect();
+    // Sort by path component count descending to process deepest directories first
+    paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            if let Some(&size) = final_sizes.get(&path) {
+                if path != root {
+                    *final_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+                }
             }
-        });
-    dir_sizes
+        }
+    }
+
+    final_sizes
 }
 
 fn build_tree(
@@ -167,7 +199,7 @@ fn build_tree(
     file_type: Option<std::fs::FileType>,
     depth: usize,
     args: &Args,
-    true_sizes: &DashMap<PathBuf, u64>,
+    true_sizes: &HashMap<PathBuf, u64, FxBuildHasher>,
 ) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
