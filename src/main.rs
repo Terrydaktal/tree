@@ -36,6 +36,10 @@ struct Args {
     /// Enable OSC 8 hyperlinks
     #[arg(long, overrides_with = "hyperlinks")]
     hyperlinks: bool,
+
+    /// Follow symbolic links
+    #[arg(short = 'H', long, overrides_with = "follow_links")]
+    follow_links: bool,
 }
 
 struct Node {
@@ -45,6 +49,7 @@ struct Node {
     children: Vec<Node>,
     total_children_count: usize,
     is_dir: bool,
+    is_symlink: bool,
 }
 
 fn main() {
@@ -53,7 +58,11 @@ fn main() {
     let use_hyperlinks = args.hyperlinks;
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let root_metadata = root_path.symlink_metadata().ok();
+    let root_metadata = if args.follow_links {
+        root_path.metadata().ok()
+    } else {
+        root_path.symlink_metadata().ok()
+    };
     
     println!("{}", root_path.display());
 
@@ -64,6 +73,7 @@ fn main() {
 
 fn build_tree(path: &Path, metadata: Option<Metadata>, depth: usize, args: &Args) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let is_symlink = path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
 
     let mut node = Node {
         path: path.to_path_buf(),
@@ -72,6 +82,7 @@ fn build_tree(path: &Path, metadata: Option<Metadata>, depth: usize, args: &Args
         children: Vec::new(),
         total_children_count: 0,
         is_dir,
+        is_symlink,
     };
 
     if is_dir && depth < args.max_depth {
@@ -79,6 +90,7 @@ fn build_tree(path: &Path, metadata: Option<Metadata>, depth: usize, args: &Args
             .max_depth(1)
             .min_depth(1)
             .skip_hidden(!args.all)
+            .follow_links(args.follow_links)
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();
@@ -149,12 +161,12 @@ fn print_node(
 
         let mut display_name = child.name.clone();
         if args.classify {
-            if let Some(md) = &child.metadata {
-                if md.file_type().is_symlink() {
-                    display_name.push('@');
-                } else if md.is_dir() {
-                    display_name.push('/');
-                } else if md.permissions().mode() & 0o111 != 0 {
+            if child.is_symlink {
+                display_name.push('@');
+            } else if child.is_dir {
+                display_name.push('/');
+            } else if let Some(md) = &child.metadata {
+                if md.permissions().mode() & 0o111 != 0 {
                     display_name.push('*');
                 }
             }
