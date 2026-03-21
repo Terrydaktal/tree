@@ -100,17 +100,24 @@ fn main() {
     } else {
         root_path.symlink_metadata().ok()
     };
+    let root_file_type = root_path.symlink_metadata().ok().map(|m| m.file_type());
     
     println!("{}", root_path.display());
 
-    if let Some(root_node) = build_tree(&root_path, root_metadata, 0, &args) {
+    if let Some(root_node) = build_tree(&root_path, root_metadata, root_file_type, 0, &args) {
         print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
     }
 }
 
-fn build_tree(path: &Path, metadata: Option<Metadata>, depth: usize, args: &Args) -> Option<Node> {
+fn build_tree(
+    path: &Path,
+    metadata: Option<Metadata>,
+    file_type: Option<std::fs::FileType>,
+    depth: usize,
+    args: &Args,
+) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_symlink = path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
 
     let mut node = Node {
         path: path.to_path_buf(),
@@ -154,7 +161,8 @@ fn build_tree(path: &Path, metadata: Option<Metadata>, depth: usize, args: &Args
         for entry in entries.into_iter().take(limit) {
             let child_path = entry.path();
             let child_metadata = entry.metadata().ok();
-            if let Some(child_node) = build_tree(&child_path, child_metadata, depth + 1, args) {
+            let child_file_type = Some(entry.file_type);
+            if let Some(child_node) = build_tree(&child_path, child_metadata, child_file_type, depth + 1, args) {
                 node.children.push(child_node);
             }
         }
@@ -177,14 +185,18 @@ fn print_node(
     for (i, child) in node.children.iter().enumerate() {
         let is_last = i == child_count - 1 && total_count <= child_count;
         
+        let color_reset = "\x1b[0m";
+        let size_color = "\x1b[1;36m";
+        let date_color = "\x1b[37m";
+
         if args.sizes {
             let size_str = child.metadata.as_ref().map(|m| format_size(m.len())).unwrap_or_else(|| "-".to_string());
-            print!("{:>10} ", size_str);
+            print!("{}{:>10}{} ", size_color, size_str, color_reset);
         }
 
         if args.times {
             let time_str = child.metadata.as_ref().map(|m| format_time(m)).unwrap_or_else(|| "-".to_string());
-            print!("{:>16} ", time_str);
+            print!("{}{:>16}{} ", date_color, time_str, color_reset);
         }
 
         // Print prefix
