@@ -1,4 +1,4 @@
-# tree-rust
+# tree
 
 A modern, high-performance version of the `tree` utility written in Rust.
 
@@ -19,8 +19,8 @@ A modern, high-performance version of the `tree` utility written in Rust.
 ### Building from Source
 
 ```bash
-git clone https://github.com/Terrydaktal/tree-rust.git
-cd tree-rust
+git clone https://github.com/Terrydaktal/tree.git
+cd tree
 cargo build --release
 ```
 
