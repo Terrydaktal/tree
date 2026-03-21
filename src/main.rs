@@ -55,6 +55,10 @@ struct Args {
     /// Show true recursive directory sizes
     #[arg(short = 'S', long, overrides_with = "truesizes")]
     truesizes: bool,
+
+    /// Sort entries by field and order (e.g. --sort size desc)
+    #[arg(long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
+    sort: Option<Vec<String>>,
 }
 
 fn format_size(bytes: u64) -> String {
@@ -191,16 +195,55 @@ fn build_tree(
             .filter_map(|e| e.ok())
             .collect();
 
-        // Sort: dirs first, then name
-        entries.sort_by(|a, b| {
-            let a_is_dir = a.file_type.is_dir();
-            let b_is_dir = b.file_type.is_dir();
-            if a_is_dir != b_is_dir {
-                b_is_dir.cmp(&a_is_dir)
-            } else {
-                a.file_name.cmp(&b.file_name)
-            }
-        });
+        let (sort_field, sort_order) = match args.sort.as_deref() {
+            Some([f, o]) => (Some(f.to_lowercase()), Some(o.to_lowercase())),
+            _ => (None, None),
+        };
+
+        // Sort: dirs first, then name (default) or custom if depth 0
+        if depth == 0 && sort_field.is_some() {
+            let field = sort_field.unwrap();
+            let order = sort_order.unwrap_or_else(|| "asc".to_string());
+
+            entries.sort_by(|a, b| {
+                let res = match field.as_str() {
+                    "size" => {
+                        let a_size = if args.truesizes && a.file_type.is_dir() {
+                            true_sizes.get(&a.path()).map(|v| *v).unwrap_or(0)
+                        } else {
+                            a.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
+                        };
+                        let b_size = if args.truesizes && b.file_type.is_dir() {
+                            true_sizes.get(&b.path()).map(|v| *v).unwrap_or(0)
+                        } else {
+                            b.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
+                        };
+                        a_size.cmp(&b_size)
+                    }
+                    "time" => {
+                        let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
+                        let b_time = b.metadata().ok().and_then(|m| m.modified().ok());
+                        a_time.cmp(&b_time)
+                    }
+                    _ => a.file_name.cmp(&b.file_name),
+                };
+                if order == "desc" {
+                    res.reverse()
+                } else {
+                    res
+                }
+            });
+        } else {
+            entries.sort_by(|a, b| {
+                let a_is_dir = a.file_type.is_dir();
+                let b_is_dir = b.file_type.is_dir();
+                if a_is_dir != b_is_dir {
+                    b_is_dir.cmp(&a_is_dir)
+                } else {
+                    a.file_name.cmp(&b.file_name)
+                }
+            });
+        }
 
         node.total_children_count = entries.len();
         
