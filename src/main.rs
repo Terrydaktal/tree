@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use jwalk::WalkDir;
 use lscolors::LsColors;
 use rayon::prelude::*;
@@ -111,6 +111,19 @@ struct Node {
     true_size: u64,
 }
 
+#[derive(Clone)]
+struct EntryStub {
+    name: String,
+    path: PathBuf,
+    metadata: Option<Metadata>,
+    file_type: std::fs::FileType,
+}
+
+struct ScanResult {
+    dir_children: HashMap<PathBuf, Vec<EntryStub>, FxBuildHasher>,
+    true_sizes: HashMap<PathBuf, u64, FxBuildHasher>,
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -125,108 +138,119 @@ fn main() {
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let root_abs = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
     
-    let true_sizes = if args.truesizes {
-        calculate_truesizes(&root_abs, &args)
-    } else {
-        HashMap::with_hasher(FxBuildHasher::default())
-    };
+    // PHASE 1: Single Unified Parallel Scan
+    let scan = perform_unified_scan(&root_abs, &args);
 
     let root_metadata = if args.follow_links {
-        root_path.metadata().ok()
+        root_abs.metadata().ok()
     } else {
-        root_path.symlink_metadata().ok()
+        root_abs.symlink_metadata().ok()
     };
-    let root_file_type = root_path.symlink_metadata().ok().map(|m| m.file_type());
+    let root_file_type = root_abs.symlink_metadata().ok().map(|m| m.file_type());
     
     println!("{}", root_path.display());
 
-    if let Some(root_node) = build_tree(&root_abs, root_metadata, root_file_type, 0, &args, &true_sizes) {
+    // PHASE 2: In-Memory Tree Build (Zero Disk IO)
+    if let Some(root_node) = build_tree_from_cache(&root_abs, root_metadata, root_file_type, 0, &args, &scan) {
         print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
     }
 }
 
-fn calculate_truesizes(root: &Path, args: &Args) -> HashMap<PathBuf, u64, FxBuildHasher> {
+fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
+    let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+    let dir_local_sizes = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
     let seen_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
-    
-    // Initial sizes map with hasher
-    let mut initial_sizes: HashMap<PathBuf, u64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-    
-    // Seed with root metadata size
+
+    // Seed root size
     if let Ok(m) = root.symlink_metadata() {
         seen_inodes.insert((m.dev(), m.ino()));
-        initial_sizes.insert(root.to_path_buf(), m.blocks() * 512);
+        dir_local_sizes.insert(root.to_path_buf(), m.blocks() * 512);
     }
 
+    let dc = Arc::clone(&dir_children);
+    let ds = Arc::clone(&dir_local_sizes);
     let si = Arc::clone(&seen_inodes);
 
-    // Parallel walk and aggregate into thread-local maps
-    let aggregated_sizes = WalkDir::new(root)
+    WalkDir::new(root)
         .skip_hidden(!args.all)
         .follow_links(args.follow_links)
         .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
-        .into_iter()
-        .par_bridge()
-        .filter_map(|e| e.ok())
-        .fold(
-            || HashMap::with_hasher(FxBuildHasher::default()),
-            |mut local_map: HashMap<PathBuf, u64, FxBuildHasher>, entry| {
-                if let Ok(m) = entry.metadata() {
-                    if si.insert((m.dev(), m.ino())) {
-                        if let Some(parent) = entry.path().parent() {
-                            *local_map.entry(parent.to_path_buf()).or_insert(0) += m.blocks() * 512;
-                        }
+        .process_read_dir(move |_depth, path, _state, children| {
+            let mut local_sum = 0;
+            let mut stubs = Vec::with_capacity(children.len());
+
+            for entry_res in children.iter().filter_map(|e| e.as_ref().ok()) {
+                let m = entry_res.metadata().ok();
+                if let Some(ref metadata) = m {
+                    if si.insert((metadata.dev(), metadata.ino())) {
+                        local_sum += metadata.blocks() * 512;
                     }
                 }
-                local_map
-            },
-        )
-        .reduce(
-            || HashMap::with_hasher(FxBuildHasher::default()),
-            |mut map1, map2| {
-                for (path, size) in map2 {
-                    *map1.entry(path).or_insert(0) += size;
-                }
-                map1
-            },
-        );
+                
+                stubs.push(EntryStub {
+                    name: entry_res.file_name.to_string_lossy().into_owned(),
+                    path: entry_res.path(),
+                    metadata: m,
+                    file_type: entry_res.file_type,
+                });
+            }
 
-    // Merge seed and walk results
-    let mut final_sizes = initial_sizes;
-    for (path, size) in aggregated_sizes {
-        *final_sizes.entry(path).or_insert(0) += size;
+            if !stubs.is_empty() {
+                dc.insert(path.to_path_buf(), stubs);
+            }
+            if local_sum > 0 {
+                *ds.entry(path.to_path_buf()).or_insert(0) += local_sum;
+            }
+        })
+        .into_iter()
+        .for_each(|_| {});
+
+    // Finalize sizes (Upward Aggregation)
+    let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+    for entry in dir_local_sizes.iter() {
+        true_sizes.insert(entry.key().clone(), *entry.value());
     }
 
-    // Second pass: Aggregate sizes upwards
-    let mut paths: Vec<_> = final_sizes.keys().cloned().collect();
-    // Sort by path component count descending to process deepest directories first
+    let mut paths: Vec<_> = true_sizes.keys().cloned().collect();
     paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
 
     for path in paths {
         if let Some(parent) = path.parent() {
-            if let Some(&size) = final_sizes.get(&path) {
-                if path != root {
-                    *final_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+            if parent.starts_with(root) || parent == root {
+                if let Some(&size) = true_sizes.get(&path) {
+                    if path != root {
+                        *true_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+                    }
                 }
             }
         }
     }
 
-    final_sizes
+    let mut final_children = HashMap::with_hasher(FxBuildHasher::default());
+    // Use Arc's internal DashMap without cloning if possible, or just iterate.
+    for entry in dir_children.iter() {
+        final_children.insert(entry.key().clone(), entry.value().clone());
+    }
+
+    ScanResult {
+        dir_children: final_children,
+        true_sizes,
+    }
 }
 
-fn build_tree(
+fn build_tree_from_cache(
     path: &Path,
     metadata: Option<Metadata>,
     file_type: Option<std::fs::FileType>,
     depth: usize,
     args: &Args,
-    true_sizes: &HashMap<PathBuf, u64, FxBuildHasher>,
+    scan: &ScanResult,
 ) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
 
     let true_size = if args.truesizes && is_dir {
-        true_sizes.get(path).map(|v| *v).unwrap_or(0)
+        scan.true_sizes.get(path).map(|v| *v).unwrap_or(0)
     } else {
         metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
     };
@@ -243,90 +267,63 @@ fn build_tree(
     };
 
     if is_dir && depth < args.max_depth {
-        let mut entries: Vec<_> = WalkDir::new(path)
-            .max_depth(1)
-            .min_depth(1)
-            .skip_hidden(!args.all)
-            .follow_links(args.follow_links)
-            .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .collect();
+        if let Some(stubs) = scan.dir_children.get(path) {
+            let mut entries = stubs.iter().collect::<Vec<_>>();
 
-        let sort_config = match (args.sortall.as_deref(), args.sort.as_deref()) {
-            (Some([f, o]), _) => Some((f.to_lowercase(), o.to_lowercase(), true)),
-            (None, Some([f, o])) => Some((f.to_lowercase(), o.to_lowercase(), false)),
-            _ => None,
-        };
+            let sort_config = match (args.sortall.as_deref(), args.sort.as_deref()) {
+                (Some([f, o]), _) => Some((f.to_lowercase(), o.to_lowercase(), true)),
+                (None, Some([f, o])) => Some((f.to_lowercase(), o.to_lowercase(), false)),
+                _ => None,
+            };
 
-        // Sort: dirs first, then name (default) or custom if criteria met
-        if let Some((field, order, apply_all)) = sort_config {
-            if apply_all || depth == 0 {
-                entries.sort_by(|a, b| {
-                    let res = match field.as_str() {
-                        "size" => {
-                            let a_size = if args.truesizes && a.file_type.is_dir() {
-                                true_sizes.get(&a.path()).map(|v| *v).unwrap_or(0)
-                            } else {
-                                a.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
-                            };
-                            let b_size = if args.truesizes && b.file_type.is_dir() {
-                                true_sizes.get(&b.path()).map(|v| *v).unwrap_or(0)
-                            } else {
-                                b.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
-                            };
-                            a_size.cmp(&b_size)
-                        }
-                        "time" => {
-                            let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
-                            let b_time = b.metadata().ok().and_then(|m| m.modified().ok());
-                            a_time.cmp(&b_time)
-                        }
-                        _ => a.file_name.cmp(&b.file_name),
-                    };
-                    if order == "desc" {
-                        res.reverse()
-                    } else {
-                        res
-                    }
-                });
+            if let Some((field, order, apply_all)) = sort_config {
+                if apply_all || depth == 0 {
+                    entries.sort_by(|a, b| {
+                        let res = match field.as_str() {
+                            "size" => {
+                                let a_size = if args.truesizes && a.file_type.is_dir() {
+                                    scan.true_sizes.get(&a.path).map(|v| *v).unwrap_or(0)
+                                } else {
+                                    a.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                                };
+                                let b_size = if args.truesizes && b.file_type.is_dir() {
+                                    scan.true_sizes.get(&b.path).map(|v| *v).unwrap_or(0)
+                                } else {
+                                    b.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                                };
+                                a_size.cmp(&b_size)
+                            }
+                            "time" => {
+                                let a_time = a.metadata.as_ref().and_then(|m| m.modified().ok());
+                                let b_time = b.metadata.as_ref().and_then(|m| m.modified().ok());
+                                a_time.cmp(&b_time)
+                            }
+                            _ => a.name.cmp(&b.name),
+                        };
+                        if order == "desc" { res.reverse() } else { res }
+                    });
+                } else {
+                    entries.sort_by(|a, b| {
+                        let a_is_dir = a.file_type.is_dir();
+                        let b_is_dir = b.file_type.is_dir();
+                        if a_is_dir != b_is_dir { b_is_dir.cmp(&a_is_dir) } else { a.name.cmp(&b.name) }
+                    });
+                }
             } else {
                 entries.sort_by(|a, b| {
                     let a_is_dir = a.file_type.is_dir();
                     let b_is_dir = b.file_type.is_dir();
-                    if a_is_dir != b_is_dir {
-                        b_is_dir.cmp(&a_is_dir)
-                    } else {
-                        a.file_name.cmp(&b.file_name)
-                    }
+                    if a_is_dir != b_is_dir { b_is_dir.cmp(&a_is_dir) } else { a.name.cmp(&b.name) }
                 });
             }
-        } else {
-            entries.sort_by(|a, b| {
-                let a_is_dir = a.file_type.is_dir();
-                let b_is_dir = b.file_type.is_dir();
-                if a_is_dir != b_is_dir {
-                    b_is_dir.cmp(&a_is_dir)
-                } else {
-                    a.file_name.cmp(&b.file_name)
+
+            node.total_children_count = entries.len();
+            let limit = if depth == 0 { node.total_children_count } else { node.total_children_count.min(args.trunc) };
+
+            for stub in entries.into_iter().take(limit) {
+                if let Some(child_node) = build_tree_from_cache(&stub.path, stub.metadata.clone(), Some(stub.file_type), depth + 1, args, scan) {
+                    node.children.push(child_node);
                 }
-            });
-        }
-
-        node.total_children_count = entries.len();
-        
-        let limit = if depth == 0 {
-            node.total_children_count
-        } else {
-            node.total_children_count.min(args.trunc)
-        };
-
-        for entry in entries.into_iter().take(limit) {
-            let child_path = entry.path();
-            let child_metadata = entry.metadata().ok();
-            let child_file_type = Some(entry.file_type);
-            if let Some(child_node) = build_tree(&child_path, child_metadata, child_file_type, depth + 1, args, true_sizes) {
-                node.children.push(child_node);
             }
         }
     }
