@@ -40,6 +40,29 @@ struct Args {
     /// Follow symbolic links
     #[arg(short = 'H', long, overrides_with = "follow_links")]
     follow_links: bool,
+
+    /// Long mode (show file size)
+    #[arg(short = 'l', long, overrides_with = "long")]
+    long: bool,
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 struct Node {
@@ -140,6 +163,11 @@ fn print_node(
     for (i, child) in node.children.iter().enumerate() {
         let is_last = i == child_count - 1 && total_count <= child_count;
         
+        if args.long {
+            let size_str = child.metadata.as_ref().map(|m| format_size(m.len())).unwrap_or_else(|| "-".to_string());
+            print!("{:>10} ", size_str);
+        }
+
         // Print prefix
         for &last in prefixes {
             if last {
@@ -201,6 +229,9 @@ fn print_node(
     }
 
     if total_count > child_count {
+        if args.long {
+            print!("{:>10} ", "");
+        }
         for &last in prefixes {
             if last {
                 print!("    ");
