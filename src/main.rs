@@ -156,7 +156,11 @@ fn print_node(
         }
 
         // Styling
-        let style = child.metadata.as_ref().and_then(|m| lscolors.style_for_path_with_metadata(&child.path, Some(m)));
+        let style = if child.is_symlink {
+            lscolors.style_for_path(&child.path)
+        } else {
+            child.metadata.as_ref().and_then(|m| lscolors.style_for_path_with_metadata(&child.path, Some(m)))
+        };
         let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();
 
         let mut display_name = child.name.clone();
