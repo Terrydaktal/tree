@@ -1,9 +1,11 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
+use dashmap::{DashMap, DashSet};
 use jwalk::WalkDir;
 use lscolors::LsColors;
+use rayon::prelude::*;
 use std::fs::Metadata;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -49,6 +51,10 @@ struct Args {
     /// Show file modification times
     #[arg(long, overrides_with = "times")]
     times: bool,
+
+    /// Show true recursive directory sizes
+    #[arg(long, overrides_with = "truesizes")]
+    truesizes: bool,
 }
 
 fn format_size(bytes: u64) -> String {
@@ -87,6 +93,7 @@ struct Node {
     total_children_count: usize,
     is_dir: bool,
     is_symlink: bool,
+    true_size: u64,
 }
 
 fn main() {
@@ -95,6 +102,13 @@ fn main() {
     let use_hyperlinks = args.hyperlinks;
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    
+    let true_sizes = if args.truesizes {
+        calculate_truesizes(&root_path, &args)
+    } else {
+        DashMap::new()
+    };
+
     let root_metadata = if args.follow_links {
         root_path.metadata().ok()
     } else {
@@ -104,9 +118,39 @@ fn main() {
     
     println!("{}", root_path.display());
 
-    if let Some(root_node) = build_tree(&root_path, root_metadata, root_file_type, 0, &args) {
+    if let Some(root_node) = build_tree(&root_path, root_metadata, root_file_type, 0, &args, &true_sizes) {
         print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
     }
+}
+
+fn calculate_truesizes(root: &Path, args: &Args) -> DashMap<PathBuf, u64> {
+    let dir_sizes = DashMap::new();
+    let seen_inodes = DashSet::new();
+
+    WalkDir::new(root)
+        .skip_hidden(!args.all)
+        .follow_links(args.follow_links)
+        .into_iter()
+        .par_bridge()
+        .filter_map(|e| e.ok())
+        .for_each(|entry| {
+            let metadata = entry.metadata().ok();
+            if let Some(m) = metadata {
+                let dev = m.dev();
+                let ino = m.ino();
+                if seen_inodes.insert((dev, ino)) {
+                    let size = m.blocks() * 512;
+                    let path = entry.path();
+                    let mut current = path.as_path();
+                    while let Some(parent) = current.parent() {
+                        *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+                        if parent == root { break; }
+                        current = parent;
+                    }
+                }
+            }
+        });
+    dir_sizes
 }
 
 fn build_tree(
@@ -115,9 +159,16 @@ fn build_tree(
     file_type: Option<std::fs::FileType>,
     depth: usize,
     args: &Args,
+    true_sizes: &DashMap<PathBuf, u64>,
 ) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
+
+    let true_size = if args.truesizes && is_dir {
+        true_sizes.get(path).map(|v| *v).unwrap_or(0)
+    } else {
+        metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+    };
 
     let mut node = Node {
         path: path.to_path_buf(),
@@ -127,6 +178,7 @@ fn build_tree(
         total_children_count: 0,
         is_dir,
         is_symlink,
+        true_size,
     };
 
     if is_dir && depth < args.max_depth {
@@ -162,7 +214,7 @@ fn build_tree(
             let child_path = entry.path();
             let child_metadata = entry.metadata().ok();
             let child_file_type = Some(entry.file_type);
-            if let Some(child_node) = build_tree(&child_path, child_metadata, child_file_type, depth + 1, args) {
+            if let Some(child_node) = build_tree(&child_path, child_metadata, child_file_type, depth + 1, args, true_sizes) {
                 node.children.push(child_node);
             }
         }
@@ -189,8 +241,13 @@ fn print_node(
         let size_color = "\x1b[1;36m";
         let date_color = "\x1b[37m";
 
-        if args.sizes {
-            let size_str = child.metadata.as_ref().map(|m| format_size(m.len())).unwrap_or_else(|| "-".to_string());
+        if args.sizes || args.truesizes {
+            let display_size = if args.truesizes {
+                child.true_size
+            } else {
+                child.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+            };
+            let size_str = format_size(display_size);
             print!("{}{:>10}{} ", size_color, size_str, color_reset);
         }
 
@@ -260,7 +317,7 @@ fn print_node(
     }
 
     if total_count > child_count {
-        if args.sizes {
+        if args.sizes || args.truesizes {
             print!("{:>10} ", "");
         }
         if args.times {
