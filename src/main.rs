@@ -1,5 +1,4 @@
 use clap::Parser;
-use is_terminal::IsTerminal;
 use jwalk::WalkDir;
 use lscolors::LsColors;
 use std::fs::Metadata;
@@ -33,6 +32,10 @@ struct Args {
     /// Truncate depth 2+ entries to this value
     #[arg(short = 'T', long, default_value = "10")]
     trunc: usize,
+
+    /// Enable OSC 8 hyperlinks
+    #[arg(long)]
+    hyperlinks: bool,
 }
 
 struct Node {
@@ -47,7 +50,7 @@ struct Node {
 fn main() {
     let args = Args::parse();
     let lscolors = LsColors::from_env().unwrap_or_default();
-    let use_hyperlinks = std::io::stdout().is_terminal();
+    let use_hyperlinks = args.hyperlinks;
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let root_metadata = root_path.symlink_metadata().ok();
