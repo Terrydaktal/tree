@@ -48,6 +48,7 @@ tree [OPTIONS] [PATH]
 - `-t, --times`: Show file modification times.
 - `-S, --truesizes`: Show true recursive directory sizes (like `dust`).
 - `--sort <FIELD> <ORDER>`: Sort top level by `size` or `time` in `asc` or `desc` order.
+- `--sortall <FIELD> <ORDER>`: Sort all levels by `size` or `time` in `asc` or `desc` order. Useful with `-T`.
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.
 - `-V, --version`: Print version.
