@@ -3,7 +3,6 @@ use clap::Parser;
 use dashmap::{DashMap, DashSet};
 use jwalk::WalkDir;
 use lscolors::LsColors;
-use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -106,6 +105,7 @@ struct Node {
     metadata: Option<Metadata>,
     children: Vec<Node>,
     total_children_count: usize,
+    omitted_size: u64,
     is_dir: bool,
     is_symlink: bool,
     true_size: u64,
@@ -117,6 +117,7 @@ struct EntryStub {
     path: PathBuf,
     metadata: Option<Metadata>,
     file_type: std::fs::FileType,
+    is_symlink: bool,
 }
 
 struct ScanResult {
@@ -151,7 +152,7 @@ fn main() {
     println!("{}", root_path.display());
 
     // PHASE 2: In-Memory Tree Build (Zero Disk IO)
-    if let Some(root_node) = build_tree_from_cache(&root_abs, root_metadata, root_file_type, 0, &args, &scan) {
+    if let Some(root_node) = build_tree_from_cache(&root_abs, root_metadata, root_file_type, None, 0, &args, &scan) {
         print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
     }
 }
@@ -160,6 +161,7 @@ fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
     let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
     let dir_local_sizes = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
     let seen_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
+    let seen_dir_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
 
     // Seed root size
     if let Ok(m) = root.symlink_metadata() {
@@ -170,17 +172,30 @@ fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
     let dc = Arc::clone(&dir_children);
     let ds = Arc::clone(&dir_local_sizes);
     let si = Arc::clone(&seen_inodes);
+    let sdi = Arc::clone(&seen_dir_inodes);
+    let follow_links = args.follow_links;
 
     WalkDir::new(root)
         .skip_hidden(!args.all)
         .follow_links(args.follow_links)
         .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
         .process_read_dir(move |_depth, path, _state, children| {
-            let mut local_sum = 0;
+            let mut local_sum = 0u64;
             let mut stubs = Vec::with_capacity(children.len());
 
-            for entry_res in children.iter().filter_map(|e| e.as_ref().ok()) {
+            for entry_res in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
                 let m = entry_res.metadata().ok();
+
+                // Avoid re-descending into duplicate directory inodes reached via different
+                // symlink paths when --follow-links is enabled.
+                if follow_links && entry_res.file_type.is_dir() {
+                    if let Some(ref metadata) = m {
+                        if !sdi.insert((metadata.dev(), metadata.ino())) {
+                            entry_res.read_children_path = None;
+                        }
+                    }
+                }
+
                 if let Some(ref metadata) = m {
                     if si.insert((metadata.dev(), metadata.ino())) {
                         local_sum += metadata.blocks() * 512;
@@ -192,15 +207,16 @@ fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
                     path: entry_res.path(),
                     metadata: m,
                     file_type: entry_res.file_type,
+                    is_symlink: entry_res.path_is_symlink(),
                 });
             }
 
             if !stubs.is_empty() {
                 dc.insert(path.to_path_buf(), stubs);
             }
-            if local_sum > 0 {
-                *ds.entry(path.to_path_buf()).or_insert(0) += local_sum;
-            }
+            // Track every scanned directory so upward aggregation can propagate
+            // through directories that have 0 local blocks but non-zero descendants.
+            *ds.entry(path.to_path_buf()).or_insert(0) += local_sum;
         })
         .into_iter()
         .for_each(|_| {});
@@ -242,12 +258,13 @@ fn build_tree_from_cache(
     path: &Path,
     metadata: Option<Metadata>,
     file_type: Option<std::fs::FileType>,
+    is_symlink_hint: Option<bool>,
     depth: usize,
     args: &Args,
     scan: &ScanResult,
 ) -> Option<Node> {
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_symlink = file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
+    let is_symlink = is_symlink_hint.unwrap_or_else(|| file_type.map(|ft| ft.is_symlink()).unwrap_or(false));
 
     let true_size = if args.truesizes && is_dir {
         scan.true_sizes.get(path).map(|v| *v).unwrap_or(0)
@@ -261,6 +278,7 @@ fn build_tree_from_cache(
         metadata,
         children: Vec::new(),
         total_children_count: 0,
+        omitted_size: 0,
         is_dir,
         is_symlink,
         true_size,
@@ -293,7 +311,7 @@ fn build_tree_from_cache(
                                 };
                                 a_size.cmp(&b_size)
                             }
-                            "time" => {
+                            "time" | "date" | "mtime" => {
                                 let a_time = a.metadata.as_ref().and_then(|m| m.modified().ok());
                                 let b_time = b.metadata.as_ref().and_then(|m| m.modified().ok());
                                 a_time.cmp(&b_time)
@@ -319,9 +337,32 @@ fn build_tree_from_cache(
 
             node.total_children_count = entries.len();
             let limit = if depth == 0 { node.total_children_count } else { node.total_children_count.min(args.trunc) };
+            node.omitted_size = entries
+                .iter()
+                .skip(limit)
+                .map(|stub| {
+                    if args.truesizes {
+                        if stub.file_type.is_dir() {
+                            scan.true_sizes.get(&stub.path).copied().unwrap_or(0)
+                        } else {
+                            stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                        }
+                    } else {
+                        stub.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+                    }
+                })
+                .sum();
 
             for stub in entries.into_iter().take(limit) {
-                if let Some(child_node) = build_tree_from_cache(&stub.path, stub.metadata.clone(), Some(stub.file_type), depth + 1, args, scan) {
+                if let Some(child_node) = build_tree_from_cache(
+                    &stub.path,
+                    stub.metadata.clone(),
+                    Some(stub.file_type),
+                    Some(stub.is_symlink),
+                    depth + 1,
+                    args,
+                    scan,
+                ) {
                     node.children.push(child_node);
                 }
             }
@@ -422,11 +463,13 @@ fn print_node(
             new_prefixes.push(is_last);
             print_node(child, depth + 1, &new_prefixes, args, lscolors, use_hyperlinks);
         }
+
     }
 
     if total_count > child_count {
         if args.sizes || args.truesizes {
-            print!("{:>10} ", "");
+            let omitted_size_str = format_size(node.omitted_size);
+            print!("{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m");
         }
         if args.times {
             print!("{:>16} ", "");
