@@ -44,11 +44,12 @@ tree [OPTIONS] [PATH]
 - `-L <MAX_DEPTH>`: Max depth to display (default: 100).
 - `-F`: Classify (add `/` for dirs, `@` for symlinks, `*` for executables).
 - `-T, --trunc <TRUNC>`: Truncate depth 2+ entries to this value (default: 10).
-- `-s, --sizes`: Show file sizes.
+- `-s, --sizes`: Show proper recursive directory sizes (like `dust`).
 - `-t, --times`: Show file modification times.
-- `-S, --truesizes`: Show true recursive directory sizes (like `dust`).
-- `--sort <FIELD> <ORDER>`: Sort top level by `size` or `time` in `asc` or `desc` order.
-- `--sortall <FIELD> <ORDER>`: Sort all levels by `size` or `time` in `asc` or `desc` order. Useful with `-T`.
+- `-l`: Alias for `-st` (show sizes and times).
+- `-r, --reverse`: Reverse the final displayed output lines.
+- `-S, --sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
+- Default ordering (without `--sort`) is by `name` ascending.
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.

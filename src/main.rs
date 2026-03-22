@@ -4,10 +4,12 @@ use dashmap::{DashMap, DashSet};
 use jwalk::WalkDir;
 use lscolors::LsColors;
 use rustc_hash::FxBuildHasher;
+use std::ffi::OsString;
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use url::Url;
 
@@ -46,7 +48,7 @@ struct Args {
     #[arg(short = 'H', long, overrides_with = "follow_links")]
     follow_links: bool,
 
-    /// Show file sizes
+    /// Show proper recursive directory sizes
     #[arg(short = 's', long, overrides_with = "sizes")]
     sizes: bool,
 
@@ -54,17 +56,17 @@ struct Args {
     #[arg(short = 't', long, overrides_with = "times")]
     times: bool,
 
-    /// Show true recursive directory sizes
-    #[arg(short = 'S', long, overrides_with = "truesizes")]
-    truesizes: bool,
+    /// Alias for -st (show sizes and times)
+    #[arg(short = 'l', overrides_with = "long_listing")]
+    long_listing: bool,
 
-    /// Sort entries by field and order (e.g. --sort size desc)
-    #[arg(long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
+    /// Reverse the final displayed output lines
+    #[arg(short = 'r', long, overrides_with = "reverse")]
+    reverse: bool,
+
+    /// Sort all levels by field and order (e.g. -S size desc)
+    #[arg(short = 'S', long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
     sort: Option<Vec<String>>,
-
-    /// Sort all levels by field and order (e.g. --sortall size desc)
-    #[arg(long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sortall")]
-    sortall: Option<Vec<String>>,
 
     /// Number of threads to use
     #[arg(short = 'j', long, default_value = "8", overrides_with = "threads")]
@@ -126,7 +128,146 @@ struct ScanResult {
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    const REVERSE_ENV_KEY: &str = "TREE_INTERNAL_REVERSE";
+
+    if args.long_listing {
+        args.sizes = true;
+        args.times = true;
+    }
+
+    if args.reverse && std::env::var_os(REVERSE_ENV_KEY).is_none() {
+        let exe = std::env::current_exe().expect("failed to resolve current executable");
+        let forwarded_args: Vec<OsString> = std::env::args_os()
+            .skip(1)
+            .filter_map(|arg| {
+                let text = arg.to_string_lossy();
+                if text == "-r" || text == "--reverse" {
+                    return None;
+                }
+                if text.starts_with('-') && !text.starts_with("--") && text.len() > 2 && text.contains('r') {
+                    let kept: String = text[1..].chars().filter(|&c| c != 'r').collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some(OsString::from(format!("-{}", kept)))
+                    }
+                } else {
+                    Some(arg)
+                }
+            })
+            .collect();
+
+        let output = Command::new(exe)
+            .args(&forwarded_args)
+            .env(REVERSE_ENV_KEY, "1")
+            .output()
+            .expect("failed to execute reverse output pass");
+
+        if !output.status.success() && !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<String> = stdout.lines().map(|s| s.to_string()).collect();
+        let strip_ansi = |line: &str| -> String {
+            let bytes = line.as_bytes();
+            let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                    i += 2;
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let plain_lines: Vec<String> = lines.iter().map(|s| strip_ansi(s)).collect();
+        let mut reversed: Vec<String> = lines.into_iter().rev().collect();
+        let reversed_plain: Vec<String> = plain_lines.into_iter().rev().collect();
+        let prefix_base = (if args.sizes { 11 } else { 0 }) + (if args.times { 17 } else { 0 });
+
+        let connector_index = |line: &str| -> Option<usize> {
+            line.find("├── ")
+                .or_else(|| line.find("└── "))
+                .or_else(|| line.find("┌── "))
+        };
+
+        let parse_depth = |line: &str| -> Option<usize> {
+            let conn_idx = connector_index(line)?;
+            if conn_idx < prefix_base {
+                return None;
+            }
+            let tree_prefix = &line[prefix_base..conn_idx];
+            let mut depth = 0usize;
+            let mut rest = tree_prefix;
+            while !rest.is_empty() {
+                if let Some(next) = rest.strip_prefix("│   ") {
+                    depth += 1;
+                    rest = next;
+                    continue;
+                }
+                if let Some(next) = rest.strip_prefix("    ") {
+                    depth += 1;
+                    rest = next;
+                    continue;
+                }
+                return None;
+            }
+            Some(depth)
+        };
+
+        let set_conn = |line: &mut String, conn: &str| {
+            if line.contains("├── ") {
+                *line = line.replacen("├── ", conn, 1);
+            } else if line.contains("└── ") {
+                *line = line.replacen("└── ", conn, 1);
+            } else if line.contains("┌── ") {
+                *line = line.replacen("┌── ", conn, 1);
+            }
+        };
+
+        let depths: Vec<Option<usize>> = reversed_plain.iter().map(|line| parse_depth(line)).collect();
+        // Reverse style: child groups use top+middle connectors only.
+        // Flip every terminating connector to a top connector first.
+        for line in &mut reversed {
+            if line.contains("└── ") {
+                set_conn(line, "┌── ");
+            }
+        }
+
+        // Root-level rows should still terminate at the final displayed row.
+        let root_indices: Vec<usize> = depths
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, depth)| if *depth == Some(0) { Some(idx) } else { None })
+            .collect();
+        for (pos, &idx) in root_indices.iter().enumerate() {
+            let conn = if root_indices.len() == 1 || pos + 1 == root_indices.len() {
+                "└── "
+            } else if pos == 0 {
+                "┌── "
+            } else {
+                "├── "
+            };
+            set_conn(&mut reversed[idx], conn);
+        }
+
+        for line in reversed {
+            println!("{}", line);
+        }
+
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
 
     // Configure Rayon thread pool
     let _ = rayon::ThreadPoolBuilder::new()
@@ -266,7 +407,7 @@ fn build_tree_from_cache(
     let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_symlink = is_symlink_hint.unwrap_or_else(|| file_type.map(|ft| ft.is_symlink()).unwrap_or(false));
 
-    let true_size = if args.truesizes && is_dir {
+    let true_size = if args.sizes && is_dir {
         scan.true_sizes.get(path).map(|v| *v).unwrap_or(0)
     } else {
         metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
@@ -288,51 +429,41 @@ fn build_tree_from_cache(
         if let Some(stubs) = scan.dir_children.get(path) {
             let mut entries = stubs.iter().collect::<Vec<_>>();
 
-            let sort_config = match (args.sortall.as_deref(), args.sort.as_deref()) {
-                (Some([f, o]), _) => Some((f.to_lowercase(), o.to_lowercase(), true)),
-                (None, Some([f, o])) => Some((f.to_lowercase(), o.to_lowercase(), false)),
-                _ => None,
-            };
-
-            if let Some((field, order, apply_all)) = sort_config {
-                if apply_all || depth == 0 {
-                    entries.sort_by(|a, b| {
-                        let res = match field.as_str() {
-                            "size" => {
-                                let a_size = if args.truesizes && a.file_type.is_dir() {
-                                    scan.true_sizes.get(&a.path).map(|v| *v).unwrap_or(0)
-                                } else {
-                                    a.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
-                                };
-                                let b_size = if args.truesizes && b.file_type.is_dir() {
-                                    scan.true_sizes.get(&b.path).map(|v| *v).unwrap_or(0)
-                                } else {
-                                    b.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
-                                };
-                                a_size.cmp(&b_size)
-                            }
-                            "time" | "date" | "mtime" => {
-                                let a_time = a.metadata.as_ref().and_then(|m| m.modified().ok());
-                                let b_time = b.metadata.as_ref().and_then(|m| m.modified().ok());
-                                a_time.cmp(&b_time)
-                            }
-                            _ => a.name.cmp(&b.name),
-                        };
-                        if order == "desc" { res.reverse() } else { res }
-                    });
-                } else {
-                    entries.sort_by(|a, b| {
-                        let a_is_dir = a.file_type.is_dir();
-                        let b_is_dir = b.file_type.is_dir();
-                        if a_is_dir != b_is_dir { b_is_dir.cmp(&a_is_dir) } else { a.name.cmp(&b.name) }
-                    });
-                }
-            } else {
-                entries.sort_by(|a, b| {
-                    let a_is_dir = a.file_type.is_dir();
-                    let b_is_dir = b.file_type.is_dir();
-                    if a_is_dir != b_is_dir { b_is_dir.cmp(&a_is_dir) } else { a.name.cmp(&b.name) }
+            let sort_config = args
+                .sort
+                .as_ref()
+                .and_then(|v| match v.as_slice() {
+                    [field, order] => Some((field.to_lowercase(), order.to_lowercase())),
+                    _ => None,
                 });
+
+            if let Some((field, order)) = sort_config {
+                entries.sort_by(|a, b| {
+                    let res = match field.as_str() {
+                        "size" => {
+                            let a_size = if args.sizes && a.file_type.is_dir() {
+                                scan.true_sizes.get(&a.path).map(|v| *v).unwrap_or(0)
+                            } else {
+                                a.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                            };
+                            let b_size = if args.sizes && b.file_type.is_dir() {
+                                scan.true_sizes.get(&b.path).map(|v| *v).unwrap_or(0)
+                            } else {
+                                b.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                            };
+                            a_size.cmp(&b_size)
+                        }
+                        "time" | "date" | "mtime" => {
+                            let a_time = a.metadata.as_ref().and_then(|m| m.modified().ok());
+                            let b_time = b.metadata.as_ref().and_then(|m| m.modified().ok());
+                            a_time.cmp(&b_time)
+                        }
+                        _ => a.name.cmp(&b.name),
+                    };
+                    if order == "desc" { res.reverse() } else { res }
+                });
+            } else {
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
             }
 
             node.total_children_count = entries.len();
@@ -341,7 +472,7 @@ fn build_tree_from_cache(
                 .iter()
                 .skip(limit)
                 .map(|stub| {
-                    if args.truesizes {
+                    if args.sizes {
                         if stub.file_type.is_dir() {
                             scan.true_sizes.get(&stub.path).copied().unwrap_or(0)
                         } else {
@@ -390,12 +521,8 @@ fn print_node(
         let size_color = "\x1b[1;36m";
         let date_color = "\x1b[37m";
 
-        if args.sizes || args.truesizes {
-            let display_size = if args.truesizes {
-                child.true_size
-            } else {
-                child.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-            };
+        if args.sizes {
+            let display_size = child.true_size;
             let size_str = format_size(display_size);
             print!("{}{:>10}{} ", size_color, size_str, color_reset);
         }
@@ -467,7 +594,7 @@ fn print_node(
     }
 
     if total_count > child_count {
-        if args.sizes || args.truesizes {
+        if args.sizes {
             let omitted_size_str = format_size(node.omitted_size);
             print!("{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m");
         }
