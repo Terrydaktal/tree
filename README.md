@@ -49,7 +49,10 @@ tree [OPTIONS] [PATH]
 - `-l`: Alias for `-st` (show sizes and times).
 - `-r, --reverse`: Reverse the final displayed output lines.
 - `-S, --sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
-- Default ordering (without `--sort`) is by `name` ascending.
+- Default ordering (without `--sort`) is:
+  - `-s` or `-l`: `size desc`
+  - `-t` (without `-s`): `time desc`
+  - otherwise: `name` ascending
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.

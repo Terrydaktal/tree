@@ -127,6 +127,21 @@ struct ScanResult {
     true_sizes: HashMap<PathBuf, u64, FxBuildHasher>,
 }
 
+fn sort_requires_metadata(sort: &Option<Vec<String>>) -> bool {
+    sort.as_ref()
+        .and_then(|v| v.first())
+        .map(|field| matches!(field.to_ascii_lowercase().as_str(), "size" | "time" | "date" | "mtime"))
+        .unwrap_or(false)
+}
+
+fn metadata_required(args: &Args) -> bool {
+    args.sizes
+        || args.times
+        || args.classify
+        || args.follow_links
+        || sort_requires_metadata(&args.sort)
+}
+
 fn main() {
     let mut args = Args::parse();
     const REVERSE_ENV_KEY: &str = "TREE_INTERNAL_REVERSE";
@@ -245,21 +260,32 @@ fn main() {
             }
         }
 
-        // Root-level rows should still terminate at the final displayed row.
+        // In reverse mode, top-level rows are usually continuing rows.
+        // Only the first displayed top-level row may use a top connector when it
+        // closes a child block directly above it.
         let root_indices: Vec<usize> = depths
             .iter()
             .enumerate()
             .filter_map(|(idx, depth)| if *depth == Some(0) { Some(idx) } else { None })
             .collect();
         for (pos, &idx) in root_indices.iter().enumerate() {
-            let conn = if root_indices.len() == 1 || pos + 1 == root_indices.len() {
-                "└── "
-            } else if pos == 0 {
-                "┌── "
+            let closes_child_block = idx > 0 && depths[idx - 1].map(|d| d > 0).unwrap_or(false);
+            if pos == 0 && closes_child_block {
+                set_conn(&mut reversed[idx], "┌── ");
             } else {
-                "├── "
-            };
-            set_conn(&mut reversed[idx], conn);
+                set_conn(&mut reversed[idx], "├── ");
+            }
+        }
+
+        // Replace reversed root marker '.' with an interpunct.
+        if let Some(last) = reversed.last_mut() {
+            if strip_ansi(last).trim() == "." {
+                *last = if prefix_base > 0 {
+                    format!("{:width$}·", "", width = prefix_base)
+                } else {
+                    "·".to_string()
+                };
+            }
         }
 
         for line in reversed {
@@ -279,18 +305,31 @@ fn main() {
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let root_abs = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
+    let need_metadata = metadata_required(&args);
     
     // PHASE 1: Single Unified Parallel Scan
-    let scan = perform_unified_scan(&root_abs, &args);
+    // `-L` caps scan depth unless recursive sizes are requested.
+    let scan_max_depth = if args.sizes { usize::MAX } else { args.max_depth };
+    let scan = perform_unified_scan(&root_abs, &args, scan_max_depth, need_metadata);
 
-    let root_metadata = if args.follow_links {
-        root_abs.metadata().ok()
+    let root_metadata = if need_metadata {
+        if args.follow_links {
+            root_abs.metadata().ok()
+        } else {
+            root_abs.symlink_metadata().ok()
+        }
     } else {
-        root_abs.symlink_metadata().ok()
+        None
     };
     let root_file_type = root_abs.symlink_metadata().ok().map(|m| m.file_type());
     
-    println!("{}", root_path.display());
+    let root_label = root_path.display().to_string();
+    if args.sizes || args.times {
+        let prefix_base = (if args.sizes { 11 } else { 0 }) + (if args.times { 17 } else { 0 });
+        println!("{:width$}{}", "", root_label, width = prefix_base);
+    } else {
+        println!("{}", root_label);
+    }
 
     // PHASE 2: In-Memory Tree Build (Zero Disk IO)
     if let Some(root_node) = build_tree_from_cache(&root_abs, root_metadata, root_file_type, None, 0, &args, &scan) {
@@ -298,48 +337,76 @@ fn main() {
     }
 }
 
-fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
+fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect_entry_metadata: bool) -> ScanResult {
     let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
-    let dir_local_sizes = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
-    let seen_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
-    let seen_dir_inodes = Arc::new(DashSet::with_hasher(FxBuildHasher::default()));
+    let collect_recursive_sizes = args.sizes;
+    let dir_local_sizes = if collect_recursive_sizes {
+        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    let seen_inodes = if collect_recursive_sizes {
+        Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    let seen_dir_inodes = if args.follow_links && collect_entry_metadata {
+        Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
 
     // Seed root size
-    if let Ok(m) = root.symlink_metadata() {
-        seen_inodes.insert((m.dev(), m.ino()));
-        dir_local_sizes.insert(root.to_path_buf(), m.blocks() * 512);
+    if collect_recursive_sizes {
+        if let Ok(m) = root.symlink_metadata() {
+            if let Some(ref si) = seen_inodes {
+                si.insert((m.dev(), m.ino()));
+            }
+            if let Some(ref ds) = dir_local_sizes {
+                ds.insert(root.to_path_buf(), m.blocks() * 512);
+            }
+        }
     }
 
     let dc = Arc::clone(&dir_children);
-    let ds = Arc::clone(&dir_local_sizes);
-    let si = Arc::clone(&seen_inodes);
-    let sdi = Arc::clone(&seen_dir_inodes);
+    let ds = dir_local_sizes.as_ref().map(Arc::clone);
+    let si = seen_inodes.as_ref().map(Arc::clone);
+    let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
     let follow_links = args.follow_links;
 
     WalkDir::new(root)
         .skip_hidden(!args.all)
         .follow_links(args.follow_links)
+        .max_depth(scan_max_depth)
         .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
         .process_read_dir(move |_depth, path, _state, children| {
             let mut local_sum = 0u64;
             let mut stubs = Vec::with_capacity(children.len());
 
             for entry_res in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
-                let m = entry_res.metadata().ok();
+                let m = if collect_entry_metadata {
+                    entry_res.metadata().ok()
+                } else {
+                    None
+                };
 
                 // Avoid re-descending into duplicate directory inodes reached via different
                 // symlink paths when --follow-links is enabled.
                 if follow_links && entry_res.file_type.is_dir() {
                     if let Some(ref metadata) = m {
-                        if !sdi.insert((metadata.dev(), metadata.ino())) {
-                            entry_res.read_children_path = None;
+                        if let Some(ref sdi_map) = sdi {
+                            if !sdi_map.insert((metadata.dev(), metadata.ino())) {
+                                entry_res.read_children_path = None;
+                            }
                         }
                     }
                 }
 
                 if let Some(ref metadata) = m {
-                    if si.insert((metadata.dev(), metadata.ino())) {
-                        local_sum += metadata.blocks() * 512;
+                    if let Some(ref si_map) = si {
+                        if si_map.insert((metadata.dev(), metadata.ino())) {
+                            local_sum += metadata.blocks() * 512;
+                        }
                     }
                 }
                 
@@ -357,31 +424,39 @@ fn perform_unified_scan(root: &Path, args: &Args) -> ScanResult {
             }
             // Track every scanned directory so upward aggregation can propagate
             // through directories that have 0 local blocks but non-zero descendants.
-            *ds.entry(path.to_path_buf()).or_insert(0) += local_sum;
+            if let Some(ref ds_map) = ds {
+                *ds_map.entry(path.to_path_buf()).or_insert(0) += local_sum;
+            }
         })
         .into_iter()
         .for_each(|_| {});
 
-    // Finalize sizes (Upward Aggregation)
-    let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-    for entry in dir_local_sizes.iter() {
-        true_sizes.insert(entry.key().clone(), *entry.value());
-    }
+    // Finalize recursive sizes only when requested.
+    let true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ds) = dir_local_sizes {
+        let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        for entry in ds.iter() {
+            true_sizes.insert(entry.key().clone(), *entry.value());
+        }
 
-    let mut paths: Vec<_> = true_sizes.keys().cloned().collect();
-    paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
+        let mut paths: Vec<_> = true_sizes.keys().cloned().collect();
+        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
 
-    for path in paths {
-        if let Some(parent) = path.parent() {
-            if parent.starts_with(root) || parent == root {
-                if let Some(&size) = true_sizes.get(&path) {
-                    if path != root {
-                        *true_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                if parent.starts_with(root) || parent == root {
+                    if let Some(&size) = true_sizes.get(&path) {
+                        if path != root {
+                            *true_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+                        }
                     }
                 }
             }
         }
-    }
+        true_sizes
+    } else {
+        HashMap::with_hasher(FxBuildHasher::default())
+    };
 
     let mut final_children = HashMap::with_hasher(FxBuildHasher::default());
     // Use Arc's internal DashMap without cloning if possible, or just iterate.
@@ -404,7 +479,11 @@ fn build_tree_from_cache(
     args: &Args,
     scan: &ScanResult,
 ) -> Option<Node> {
-    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let is_dir = metadata
+        .as_ref()
+        .map(|m| m.is_dir())
+        .or_else(|| file_type.map(|ft| ft.is_dir()))
+        .unwrap_or(false);
     let is_symlink = is_symlink_hint.unwrap_or_else(|| file_type.map(|ft| ft.is_symlink()).unwrap_or(false));
 
     let true_size = if args.sizes && is_dir {
@@ -435,6 +514,15 @@ fn build_tree_from_cache(
                 .and_then(|v| match v.as_slice() {
                     [field, order] => Some((field.to_lowercase(), order.to_lowercase())),
                     _ => None,
+                })
+                .or_else(|| {
+                    if args.sizes {
+                        Some(("size".to_string(), "desc".to_string()))
+                    } else if args.times {
+                        Some(("time".to_string(), "desc".to_string()))
+                    } else {
+                        Some(("name".to_string(), "asc".to_string()))
+                    }
                 });
 
             if let Some((field, order)) = sort_config {
@@ -462,27 +550,25 @@ fn build_tree_from_cache(
                     };
                     if order == "desc" { res.reverse() } else { res }
                 });
-            } else {
-                entries.sort_by(|a, b| a.name.cmp(&b.name));
             }
 
             node.total_children_count = entries.len();
             let limit = if depth == 0 { node.total_children_count } else { node.total_children_count.min(args.trunc) };
-            node.omitted_size = entries
-                .iter()
-                .skip(limit)
-                .map(|stub| {
-                    if args.sizes {
+            node.omitted_size = if args.sizes {
+                entries
+                    .iter()
+                    .skip(limit)
+                    .map(|stub| {
                         if stub.file_type.is_dir() {
                             scan.true_sizes.get(&stub.path).copied().unwrap_or(0)
                         } else {
                             stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
                         }
-                    } else {
-                        stub.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                    }
-                })
-                .sum();
+                    })
+                    .sum()
+            } else {
+                0
+            };
 
             for stub in entries.into_iter().take(limit) {
                 if let Some(child_node) = build_tree_from_cache(
@@ -550,8 +636,10 @@ fn print_node(
         // Styling
         let style = if child.is_symlink {
             lscolors.style_for_path(&child.path)
+        } else if let Some(m) = child.metadata.as_ref() {
+            lscolors.style_for_path_with_metadata(&child.path, Some(m))
         } else {
-            child.metadata.as_ref().and_then(|m| lscolors.style_for_path_with_metadata(&child.path, Some(m)))
+            lscolors.style_for_path(&child.path)
         };
         let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();
 
