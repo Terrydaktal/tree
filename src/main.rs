@@ -260,17 +260,15 @@ fn main() {
             }
         }
 
-        // In reverse mode, top-level rows are usually continuing rows.
-        // Only the first displayed top-level row may use a top connector when it
-        // closes a child block directly above it.
+        // In reverse mode, the first displayed top-level row is the top connector.
+        // Remaining top-level rows are continuing rows.
         let root_indices: Vec<usize> = depths
             .iter()
             .enumerate()
             .filter_map(|(idx, depth)| if *depth == Some(0) { Some(idx) } else { None })
             .collect();
         for (pos, &idx) in root_indices.iter().enumerate() {
-            let closes_child_block = idx > 0 && depths[idx - 1].map(|d| d > 0).unwrap_or(false);
-            if pos == 0 && closes_child_block {
+            if pos == 0 {
                 set_conn(&mut reversed[idx], "┌── ");
             } else {
                 set_conn(&mut reversed[idx], "├── ");
@@ -521,7 +519,7 @@ fn build_tree_from_cache(
                     } else if args.times {
                         Some(("time".to_string(), "desc".to_string()))
                     } else {
-                        Some(("name".to_string(), "asc".to_string()))
+                        None
                     }
                 });
 
@@ -550,6 +548,10 @@ fn build_tree_from_cache(
                     };
                     if order == "desc" { res.reverse() } else { res }
                 });
+            } else {
+                // Plain default: type grouping only (directories first), preserve
+                // traversal order within each group.
+                entries.sort_by(|a, b| b.file_type.is_dir().cmp(&a.file_type.is_dir()));
             }
 
             node.total_children_count = entries.len();

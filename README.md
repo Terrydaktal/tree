@@ -52,7 +52,7 @@ tree [OPTIONS] [PATH]
 - Default ordering (without `--sort`) is:
   - `-s` or `-l`: `size desc`
   - `-t` (without `-s`): `time desc`
-  - otherwise: `name` ascending
+  - otherwise: type grouping (directories first, then non-directories)
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.
