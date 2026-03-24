@@ -8,6 +8,7 @@ A modern, high-performance version of the `tree` utility written in Rust.
 - **Modern Terminal Support**: Includes **OSC 8 Hyperlinks** (clickable files and directories) and respects the `LS_COLORS` environment variable.
 - **Smart Truncation**: Always displays everything at the top level (depth 1), but truncates subdirectories (depth 2+) based on the `-T <value>` parameter with an `... and x more` entry.
 - **Type Classification**: Supports the `-F` flag to add suffixes (`/` for directories, `@` for symbolic links, and `*` for executables).
+- **Raw Path Cache**: Supports `--cache-raw` to write the currently displayed paths into cache files for downstream shell tooling.
 - **Optimized**: Built with `jemalloc` for memory efficiency and compiled with `target-cpu=native` for maximum performance on your hardware.
 
 ## Installation
@@ -48,11 +49,15 @@ tree [OPTIONS] [PATH]
 - `-d, --dirs-only`: Show directories only.
 - `-G, --no-expand-git`: Toggle `.git/` expansion state (repeat to toggle back; e.g. `-G -G` cancels).
 - `--deep`: Alias for `-L 20 -T 2`.
+- `-H, --follow-links`: Follow symbolic links.
 - `-s, --sizes`: Show proper recursive directory sizes (like `dust`).
 - `-t, --times`: Show file modification times.
 - `-c, --counts`: Show total recursive counts as `dirs` and `files` columns before the tree.
 - `-l`: Alias for `-stc` (show sizes, times, and counts).
 - `-r, --reverse`: Reverse the final displayed output lines.
+- `--cache-raw`: Write shown full paths to:
+  - `~/.cache/universal-last-dirs`
+  - `~/.cache/universal-last-files`
 - `-S, --sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
 - Default ordering (without `--sort`) is:
   - `-s` only: `size desc`
