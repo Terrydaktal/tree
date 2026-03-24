@@ -85,7 +85,7 @@ struct Args {
     #[arg(short = 'r', long, overrides_with = "reverse")]
     reverse: bool,
 
-    /// Cache shown output paths to ~/.cache/universal-last-dirs and ~/.cache/universal-last-files
+    /// Cache shown output paths to /tmp/fzf-history-$USER/universal-last-{dirs,files}-<pid>
     #[arg(long, overrides_with = "cache_raw")]
     cache_raw: bool,
 
@@ -213,16 +213,43 @@ fn write_path_list(cache_path: &Path, paths: &[PathBuf]) -> std::io::Result<()> 
     std::fs::write(cache_path, output)
 }
 
-fn write_cache_raw_paths(dir_paths: &[PathBuf], file_paths: &[PathBuf]) -> std::io::Result<()> {
-    let cache_dir = if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache")
-    } else {
-        PathBuf::from(".cache")
-    };
+fn cache_pid_suffix() -> u32 {
+    if let Some(value) = std::env::var_os("fish_pid") {
+        if let Some(text) = value.to_str() {
+            if let Ok(pid) = text.parse::<u32>() {
+                return pid;
+            }
+        }
+    }
 
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        if let Some((_, after_comm)) = stat.rsplit_once(") ") {
+            let mut fields = after_comm.split_whitespace();
+            let _state = fields.next();
+            if let Some(ppid_field) = fields.next() {
+                if let Ok(ppid) = ppid_field.parse::<u32>() {
+                    return ppid;
+                }
+            }
+        }
+    }
+
+    std::process::id()
+}
+
+fn write_cache_raw_paths(dir_paths: &[PathBuf], file_paths: &[PathBuf]) -> std::io::Result<()> {
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let cache_dir = PathBuf::from("/tmp").join(format!("fzf-history-{}", user));
+    let pid = cache_pid_suffix();
     std::fs::create_dir_all(&cache_dir)?;
-    write_path_list(&cache_dir.join("universal-last-dirs"), dir_paths)?;
-    write_path_list(&cache_dir.join("universal-last-files"), file_paths)
+    write_path_list(
+        &cache_dir.join(format!("universal-last-dirs-{}", pid)),
+        dir_paths,
+    )?;
+    write_path_list(
+        &cache_dir.join(format!("universal-last-files-{}", pid)),
+        file_paths,
+    )
 }
 
 fn to_full_path(path: &Path) -> PathBuf {

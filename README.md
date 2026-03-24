@@ -55,9 +55,9 @@ tree [OPTIONS] [PATH]
 - `-c, --counts`: Show total recursive counts as `dirs` and `files` columns before the tree.
 - `-l`: Alias for `-stc` (show sizes, times, and counts).
 - `-r, --reverse`: Reverse the final displayed output lines.
-- `--cache-raw`: Write shown full paths to:
-  - `~/.cache/universal-last-dirs`
-  - `~/.cache/universal-last-files`
+- `--cache-raw`: Write shown full paths to session-scoped files in `/tmp/fzf-history-$USER/`:
+  - `universal-last-dirs-<pid>`
+  - `universal-last-files-<pid>`
 - `-S, --sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
 - Default ordering (without `--sort`) is:
   - `-s` only: `size desc`
