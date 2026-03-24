@@ -5,7 +5,7 @@ use jwalk::WalkDir;
 use lscolors::LsColors;
 use rustc_hash::FxBuildHasher;
 use std::ffi::OsString;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::fs::Metadata;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -84,6 +84,10 @@ struct Args {
     /// Reverse the final displayed output lines
     #[arg(short = 'r', long, overrides_with = "reverse")]
     reverse: bool,
+
+    /// Cache shown output paths to ~/.cache/universal-last-dirs and ~/.cache/universal-last-files
+    #[arg(long, overrides_with = "cache_raw")]
+    cache_raw: bool,
 
     /// Sort all levels by field and order (e.g. -S size desc)
     #[arg(short = 'S', long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
@@ -200,6 +204,43 @@ fn compute_count_column_layout(node: &Node, args: &Args) -> CountColumnLayout {
     }
 }
 
+fn write_path_list(cache_path: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
+    let mut output = String::new();
+    for path in paths {
+        output.push_str(&path.to_string_lossy());
+        output.push('\n');
+    }
+    std::fs::write(cache_path, output)
+}
+
+fn write_cache_raw_paths(dir_paths: &[PathBuf], file_paths: &[PathBuf]) -> std::io::Result<()> {
+    let cache_dir = if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache")
+    } else {
+        PathBuf::from(".cache")
+    };
+
+    std::fs::create_dir_all(&cache_dir)?;
+    write_path_list(&cache_dir.join("universal-last-dirs"), dir_paths)?;
+    write_path_list(&cache_dir.join("universal-last-files"), file_paths)
+}
+
+fn to_full_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn is_executable_path(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|md| md.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn cmp_name(a: &str, b: &str) -> Ordering {
     a.to_ascii_lowercase()
         .cmp(&b.to_ascii_lowercase())
@@ -250,7 +291,6 @@ fn sort_requires_metadata(sort: &Option<Vec<String>>) -> bool {
 fn metadata_required(args: &Args) -> bool {
     args.sizes
         || args.times
-        || args.classify
         || args.follow_links
         || sort_requires_metadata(&args.sort)
 }
@@ -511,6 +551,23 @@ fn main() {
         println!("{}", root_label);
     }
 
+    let mut shown_dir_paths: Vec<PathBuf> = Vec::new();
+    let mut shown_file_paths: Vec<PathBuf> = Vec::new();
+    if args.cache_raw {
+        let root_full_path = to_full_path(&root_abs);
+        if let Some(root_node_ref) = root_node.as_ref() {
+            if root_node_ref.is_dir {
+                shown_dir_paths.push(root_full_path);
+            } else {
+                shown_file_paths.push(root_full_path);
+            }
+        } else if root_file_type.map(|ft| ft.is_dir()).unwrap_or(true) {
+            shown_dir_paths.push(root_full_path);
+        } else {
+            shown_file_paths.push(root_full_path);
+        }
+    }
+
     if let Some(root_node) = root_node {
         print_node(
             &root_node,
@@ -520,7 +577,19 @@ fn main() {
             &lscolors,
             use_hyperlinks,
             count_layout,
+            &mut shown_dir_paths,
+            &mut shown_file_paths,
         );
+
+        if args.cache_raw {
+            if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
+                eprintln!("failed to write --cache-raw file: {}", err);
+            }
+        }
+    } else if args.cache_raw {
+        if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
+            eprintln!("failed to write --cache-raw file: {}", err);
+        }
     }
 }
 
@@ -587,13 +656,14 @@ fn perform_unified_scan(
     let si = seen_inodes.as_ref().map(Arc::clone);
     let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
     let follow_links = args.follow_links;
+    let render_max_depth = args.max_depth;
     let scan_root = root.to_path_buf();
     WalkDir::new(root)
         .skip_hidden(!show_all)
         .follow_links(args.follow_links)
         .max_depth(scan_max_depth)
         .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
-        .process_read_dir(move |_depth, path, _state, children| {
+        .process_read_dir(move |depth, path, _state, children| {
             let current_path = if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -602,7 +672,12 @@ fn perform_unified_scan(
             let mut local_sum = 0u64;
             let mut local_file_count = 0u64;
             let mut local_dir_count = 0u64;
-            let mut stubs = Vec::with_capacity(children.len());
+            let should_cache_children = depth.unwrap_or(0) < render_max_depth;
+            let mut stubs = if should_cache_children {
+                Some(Vec::with_capacity(children.len()))
+            } else {
+                None
+            };
 
             for entry_res in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
                 if no_expand_git
@@ -643,17 +718,21 @@ fn perform_unified_scan(
                     local_dir_count += 1;
                 }
                 
-                stubs.push(EntryStub {
-                    name: entry_res.file_name.to_string_lossy().into_owned(),
-                    path: current_path.join(&entry_res.file_name),
-                    metadata: m,
-                    file_type: entry_res.file_type,
-                    is_symlink: entry_res.path_is_symlink(),
-                });
+                if let Some(ref mut stubs_vec) = stubs {
+                    stubs_vec.push(EntryStub {
+                        name: entry_res.file_name.to_string_lossy().into_owned(),
+                        path: current_path.join(&entry_res.file_name),
+                        metadata: m,
+                        file_type: entry_res.file_type,
+                        is_symlink: entry_res.path_is_symlink(),
+                    });
+                }
             }
 
-            if !stubs.is_empty() {
-                dc.insert(current_path.clone(), stubs);
+            if let Some(stubs_vec) = stubs {
+                if !stubs_vec.is_empty() {
+                    dc.insert(current_path.clone(), stubs_vec);
+                }
             }
             // Track every scanned directory so upward aggregation can propagate
             // through directories that have 0 local blocks but non-zero descendants.
@@ -670,91 +749,79 @@ fn perform_unified_scan(
         .into_iter()
         .for_each(|_| {});
 
-    // Finalize recursive sizes only when requested.
-    let true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ds) = dir_local_sizes {
-        let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
-        for entry in ds.iter() {
-            true_sizes.insert(entry.key().clone(), *entry.value());
+    let mut true_sizes: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ds) = dir_local_sizes {
+        match Arc::try_unwrap(ds) {
+            Ok(map) => map.into_iter().collect(),
+            Err(map) => map
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect(),
         }
-
-        let mut paths: Vec<_> = true_sizes.keys().cloned().collect();
-        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-        for path in paths {
-            if let Some(parent) = path.parent() {
-                if parent.starts_with(root) || parent == root {
-                    if let Some(&size) = true_sizes.get(&path) {
-                        if path != root {
-                            *true_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
-                        }
-                    }
-                }
-            }
-        }
-        true_sizes
     } else {
         HashMap::with_hasher(FxBuildHasher::default())
     };
-    let true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(dfc) = dir_local_file_counts {
-        let mut true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
-        for entry in dfc.iter() {
-            true_file_counts.insert(entry.key().clone(), *entry.value());
-        }
-
-        let mut paths: Vec<_> = true_file_counts.keys().cloned().collect();
-        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-        for path in paths {
-            if let Some(parent) = path.parent() {
-                if parent.starts_with(root) || parent == root {
-                    if let Some(&count) = true_file_counts.get(&path) {
-                        if path != root {
-                            *true_file_counts.entry(parent.to_path_buf()).or_insert(0) += count;
-                        }
-                    }
-                }
+    let mut true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> =
+        if let Some(dfc) = dir_local_file_counts {
+            match Arc::try_unwrap(dfc) {
+                Ok(map) => map.into_iter().collect(),
+                Err(map) => map
+                    .iter()
+                    .map(|entry| (entry.key().clone(), *entry.value()))
+                    .collect(),
             }
+        } else {
+            HashMap::with_hasher(FxBuildHasher::default())
+        };
+    let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ddc) = dir_local_dir_counts {
+        match Arc::try_unwrap(ddc) {
+            Ok(map) => map.into_iter().collect(),
+            Err(map) => map
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect(),
         }
-        true_file_counts
-    } else {
-        HashMap::with_hasher(FxBuildHasher::default())
-    };
-    let true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ddc) = dir_local_dir_counts {
-        let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
-        for entry in ddc.iter() {
-            true_dir_counts.insert(entry.key().clone(), *entry.value());
-        }
-
-        let mut paths: Vec<_> = true_dir_counts.keys().cloned().collect();
-        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-        for path in paths {
-            if let Some(parent) = path.parent() {
-                if parent.starts_with(root) || parent == root {
-                    if let Some(&count) = true_dir_counts.get(&path) {
-                        if path != root {
-                            *true_dir_counts.entry(parent.to_path_buf()).or_insert(0) += count;
-                        }
-                    }
-                }
-            }
-        }
-        true_dir_counts
     } else {
         HashMap::with_hasher(FxBuildHasher::default())
     };
 
-    let mut final_children = HashMap::with_hasher(FxBuildHasher::default());
-    // Use Arc's internal DashMap without cloning if possible, or just iterate.
-    for entry in dir_children.iter() {
-        final_children.insert(entry.key().clone(), entry.value().clone());
+    let mut path_set: HashSet<PathBuf, FxBuildHasher> = HashSet::with_hasher(FxBuildHasher::default());
+    path_set.extend(true_sizes.keys().cloned());
+    path_set.extend(true_file_counts.keys().cloned());
+    path_set.extend(true_dir_counts.keys().cloned());
+    let mut paths: Vec<PathBuf> = path_set.into_iter().collect();
+    paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+    for path in paths {
+        if path == root {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            if !(parent.starts_with(root) || parent == root) {
+                continue;
+            }
+            let parent_path = parent.to_path_buf();
+            if let Some(value) = true_sizes.get(&path).copied() {
+                *true_sizes.entry(parent_path.clone()).or_insert(0) += value;
+            }
+            if let Some(value) = true_file_counts.get(&path).copied() {
+                *true_file_counts.entry(parent_path.clone()).or_insert(0) += value;
+            }
+            if let Some(value) = true_dir_counts.get(&path).copied() {
+                *true_dir_counts.entry(parent_path).or_insert(0) += value;
+            }
+        }
     }
 
+    let dir_children = match Arc::try_unwrap(dir_children) {
+        Ok(map) => map.into_iter().collect(),
+        Err(map) => map
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect(),
+    };
+
     ScanResult {
-        dir_children: final_children,
+        dir_children,
         true_sizes,
         true_dir_counts,
         true_file_counts,
@@ -1011,6 +1078,8 @@ fn print_node(
     lscolors: &LsColors,
     use_hyperlinks: bool,
     count_layout: CountColumnLayout,
+    shown_dir_paths: &mut Vec<PathBuf>,
+    shown_file_paths: &mut Vec<PathBuf>,
 ) {
     let child_count = node.children.len();
     let total_count = node.total_children_count;
@@ -1072,8 +1141,13 @@ fn print_node(
                 display_name.push('@');
             } else if child.is_dir {
                 display_name.push('/');
-            } else if let Some(md) = &child.metadata {
-                if md.permissions().mode() & 0o111 != 0 {
+            } else {
+                let is_exec = child
+                    .metadata
+                    .as_ref()
+                    .map(|md| md.permissions().mode() & 0o111 != 0)
+                    .unwrap_or_else(|| is_executable_path(&child.path));
+                if is_exec {
                     display_name.push('*');
                 }
             }
@@ -1095,6 +1169,13 @@ fn print_node(
             print!("{}", colored_name);
         }
         println!();
+        if args.cache_raw {
+            if child.is_dir {
+                shown_dir_paths.push(child.path.clone());
+            } else {
+                shown_file_paths.push(child.path.clone());
+            }
+        }
 
         if child.is_dir {
             let mut new_prefixes = prefixes.to_vec();
@@ -1107,6 +1188,8 @@ fn print_node(
                 lscolors,
                 use_hyperlinks,
                 count_layout,
+                shown_dir_paths,
+                shown_file_paths,
             );
         }
 
