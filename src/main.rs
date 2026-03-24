@@ -6,6 +6,7 @@ use lscolors::LsColors;
 use rustc_hash::FxBuildHasher;
 use std::ffi::OsString;
 use std::collections::HashMap;
+use std::cmp::Ordering;
 use std::fs::Metadata;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -24,9 +25,9 @@ struct Args {
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
 
-    /// Show hidden files
-    #[arg(short = 'a', overrides_with = "all")]
-    all: bool,
+    /// Toggle showing hidden files (double application cancels: -aa)
+    #[arg(short = 'a', action = clap::ArgAction::Count)]
+    all_toggles: u8,
 
     /// Max depth to display
     #[arg(short = 'L', default_value = "100", overrides_with = "max_depth")]
@@ -39,6 +40,22 @@ struct Args {
     /// Truncate depth 2+ entries to this value
     #[arg(short = 'T', long, default_value = "10", overrides_with = "trunc")]
     trunc: usize,
+
+    /// Hide the "... and N more" summary rows
+    #[arg(short = 'M', long = "hide-more-count", overrides_with = "hide_more_count")]
+    hide_more_count: bool,
+
+    /// Alias for -L 20 -T 2
+    #[arg(long = "deep", overrides_with = "deep")]
+    deep: bool,
+
+    /// Show directories only
+    #[arg(short = 'd', long = "dirs-only", overrides_with = "dirs_only")]
+    dirs_only: bool,
+
+    /// Toggle .git expansion behavior (double application cancels: -GG)
+    #[arg(short = 'G', long = "no-expand-git", action = clap::ArgAction::Count)]
+    no_expand_git_toggles: u8,
 
     /// Enable OSC 8 hyperlinks
     #[arg(long, overrides_with = "hyperlinks")]
@@ -56,7 +73,11 @@ struct Args {
     #[arg(short = 't', long, overrides_with = "times")]
     times: bool,
 
-    /// Alias for -st (show sizes and times)
+    /// Show total recursive directory and file counts
+    #[arg(short = 'c', long, overrides_with = "counts")]
+    counts: bool,
+
+    /// Alias for -stc (show sizes, times, and counts)
     #[arg(short = 'l', overrides_with = "long_listing")]
     long_listing: bool,
 
@@ -101,6 +122,90 @@ fn format_time(metadata: &Metadata) -> String {
     }
 }
 
+fn format_count(value: u64) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn count_num_len(value: u64) -> usize {
+    format_count(value).len()
+}
+
+#[derive(Clone, Copy)]
+struct CountColumnLayout {
+    dir_width: usize,
+    file_width: usize,
+}
+
+impl CountColumnLayout {
+    fn pair_width(self) -> usize {
+        self.dir_width + 1 + 1 + self.file_width + 1 // "<dir>d <file>f"
+    }
+}
+
+fn print_recursive_count_pair(
+    dir_count: u64,
+    file_count: u64,
+    count_layout: CountColumnLayout,
+) {
+    let dir_str = format_count(dir_count);
+    let file_str = format_count(file_count);
+    let count_color = "\x1b[1;33m";
+    let color_reset = "\x1b[0m";
+    print!("{}{}{}d", count_color, dir_str, color_reset);
+    if count_layout.dir_width > dir_str.len() {
+        print!("{:width$}", "", width = count_layout.dir_width - dir_str.len());
+    }
+    print!(" ");
+    print!("{}{}{}f", count_color, file_str, color_reset);
+    if count_layout.file_width > file_str.len() {
+        print!("{:width$}", "", width = count_layout.file_width - file_str.len());
+    }
+    print!(" ");
+}
+
+fn compute_count_column_layout(node: &Node, args: &Args) -> CountColumnLayout {
+    let mut dir_width = 1usize;
+    let mut file_width = 1usize;
+
+    for child in &node.children {
+        dir_width = dir_width.max(count_num_len(child.recursive_dir_count));
+        file_width = file_width.max(count_num_len(child.recursive_file_count));
+        if child.is_dir {
+            let nested = compute_count_column_layout(child, args);
+            dir_width = dir_width.max(nested.dir_width);
+            file_width = file_width.max(nested.file_width);
+        }
+    }
+
+    let child_count = node.children.len();
+    if node.total_children_count > child_count
+        && !args.hide_more_count
+        && (!args.dirs_only || node.omitted_dirs_count > 0)
+    {
+        dir_width = dir_width.max(count_num_len(node.omitted_recursive_dir_count));
+        file_width = file_width.max(count_num_len(node.omitted_recursive_file_count));
+    }
+
+    CountColumnLayout {
+        dir_width,
+        file_width,
+    }
+}
+
+fn cmp_name(a: &str, b: &str) -> Ordering {
+    a.to_ascii_lowercase()
+        .cmp(&b.to_ascii_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
 struct Node {
     path: PathBuf,
     name: String,
@@ -108,9 +213,15 @@ struct Node {
     children: Vec<Node>,
     total_children_count: usize,
     omitted_size: u64,
+    omitted_recursive_dir_count: u64,
+    omitted_recursive_file_count: u64,
+    omitted_dirs_count: usize,
+    omitted_files_count: usize,
     is_dir: bool,
     is_symlink: bool,
     true_size: u64,
+    recursive_dir_count: u64,
+    recursive_file_count: u64,
 }
 
 #[derive(Clone)]
@@ -125,6 +236,8 @@ struct EntryStub {
 struct ScanResult {
     dir_children: HashMap<PathBuf, Vec<EntryStub>, FxBuildHasher>,
     true_sizes: HashMap<PathBuf, u64, FxBuildHasher>,
+    true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher>,
+    true_file_counts: HashMap<PathBuf, u64, FxBuildHasher>,
 }
 
 fn sort_requires_metadata(sort: &Option<Vec<String>>) -> bool {
@@ -149,6 +262,23 @@ fn main() {
     if args.long_listing {
         args.sizes = true;
         args.times = true;
+        args.counts = true;
+    }
+
+    let show_all = args.all_toggles % 2 == 1;
+
+    // .git expansion precedence:
+    // - default: do not expand
+    // - `-a` expands
+    // - each `-G` flips the state (`-G -G` cancels back)
+    let mut no_expand_git = !show_all;
+    if args.no_expand_git_toggles % 2 == 1 {
+        no_expand_git = !no_expand_git;
+    }
+
+    if args.deep {
+        args.max_depth = 20;
+        args.trunc = 2;
     }
 
     if args.reverse && std::env::var_os(REVERSE_ENV_KEY).is_none() {
@@ -209,13 +339,16 @@ fn main() {
         let plain_lines: Vec<String> = lines.iter().map(|s| strip_ansi(s)).collect();
         let mut reversed: Vec<String> = lines.into_iter().rev().collect();
         let reversed_plain: Vec<String> = plain_lines.into_iter().rev().collect();
-        let prefix_base = (if args.sizes { 11 } else { 0 }) + (if args.times { 17 } else { 0 });
-
         let connector_index = |line: &str| -> Option<usize> {
             line.find("├── ")
                 .or_else(|| line.find("└── "))
                 .or_else(|| line.find("┌── "))
         };
+        let prefix_base = reversed_plain
+            .iter()
+            .filter_map(|line| connector_index(line))
+            .min()
+            .unwrap_or(0);
 
         let parse_depth = |line: &str| -> Option<usize> {
             let conn_idx = connector_index(line)?;
@@ -306,9 +439,29 @@ fn main() {
     let need_metadata = metadata_required(&args);
     
     // PHASE 1: Single Unified Parallel Scan
-    // `-L` caps scan depth unless recursive sizes are requested.
-    let scan_max_depth = if args.sizes { usize::MAX } else { args.max_depth };
-    let scan = perform_unified_scan(&root_abs, &args, scan_max_depth, need_metadata);
+    // `-L` caps scan depth unless recursive aggregates are requested.
+    let mut scan_max_depth = if args.sizes || args.counts {
+        usize::MAX
+    } else {
+        args.max_depth
+    };
+    if no_expand_git {
+        if root_abs
+            .file_name()
+            .map(|name| name == ".git")
+            .unwrap_or(false)
+        {
+            scan_max_depth = 0;
+        }
+    }
+    let scan = perform_unified_scan(
+        &root_abs,
+        &args,
+        scan_max_depth,
+        need_metadata,
+        show_all,
+        no_expand_git,
+    );
 
     let root_metadata = if need_metadata {
         if args.follow_links {
@@ -321,24 +474,79 @@ fn main() {
     };
     let root_file_type = root_abs.symlink_metadata().ok().map(|m| m.file_type());
     
+    // PHASE 2: In-Memory Tree Build (Zero Disk IO)
+    let root_node = build_tree_from_cache(
+        &root_abs,
+        root_metadata,
+        root_file_type,
+        None,
+        0,
+        &args,
+        &scan,
+        no_expand_git,
+    );
+
+    let count_layout = if args.counts {
+        root_node
+            .as_ref()
+            .map(|n| compute_count_column_layout(n, &args))
+            .unwrap_or(CountColumnLayout {
+                dir_width: 1,
+                file_width: 1,
+            })
+    } else {
+        CountColumnLayout {
+            dir_width: 0,
+            file_width: 0,
+        }
+    };
+
     let root_label = root_path.display().to_string();
-    if args.sizes || args.times {
-        let prefix_base = (if args.sizes { 11 } else { 0 }) + (if args.times { 17 } else { 0 });
+    if args.counts || args.sizes || args.times {
+        let prefix_base = (if args.counts { count_layout.pair_width() + 1 } else { 0 })
+            + (if args.sizes { 11 } else { 0 })
+            + (if args.times { 17 } else { 0 });
         println!("{:width$}{}", "", root_label, width = prefix_base);
     } else {
         println!("{}", root_label);
     }
 
-    // PHASE 2: In-Memory Tree Build (Zero Disk IO)
-    if let Some(root_node) = build_tree_from_cache(&root_abs, root_metadata, root_file_type, None, 0, &args, &scan) {
-        print_node(&root_node, 0, &Vec::new(), &args, &lscolors, use_hyperlinks);
+    if let Some(root_node) = root_node {
+        print_node(
+            &root_node,
+            0,
+            &Vec::new(),
+            &args,
+            &lscolors,
+            use_hyperlinks,
+            count_layout,
+        );
     }
 }
 
-fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect_entry_metadata: bool) -> ScanResult {
+fn perform_unified_scan(
+    root: &Path,
+    args: &Args,
+    scan_max_depth: usize,
+    collect_entry_metadata: bool,
+    show_all: bool,
+    no_expand_git: bool,
+) -> ScanResult {
     let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
     let collect_recursive_sizes = args.sizes;
+    let collect_recursive_file_counts = args.counts;
+    let collect_recursive_dir_counts = args.counts;
     let dir_local_sizes = if collect_recursive_sizes {
+        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    let dir_local_file_counts = if collect_recursive_file_counts {
+        Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    let dir_local_dir_counts = if collect_recursive_dir_counts {
         Some(Arc::new(DashMap::with_hasher(FxBuildHasher::default())))
     } else {
         None
@@ -354,7 +562,7 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
         None
     };
 
-    // Seed root size
+    // Seed root size and file-count accumulation.
     if collect_recursive_sizes {
         if let Ok(m) = root.symlink_metadata() {
             if let Some(ref si) = seen_inodes {
@@ -365,23 +573,45 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
             }
         }
     }
+    if let Some(ref dfc) = dir_local_file_counts {
+        dfc.insert(root.to_path_buf(), 0);
+    }
+    if let Some(ref ddc) = dir_local_dir_counts {
+        ddc.insert(root.to_path_buf(), 0);
+    }
 
     let dc = Arc::clone(&dir_children);
     let ds = dir_local_sizes.as_ref().map(Arc::clone);
+    let dfc = dir_local_file_counts.as_ref().map(Arc::clone);
+    let ddc = dir_local_dir_counts.as_ref().map(Arc::clone);
     let si = seen_inodes.as_ref().map(Arc::clone);
     let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
     let follow_links = args.follow_links;
-
+    let scan_root = root.to_path_buf();
     WalkDir::new(root)
-        .skip_hidden(!args.all)
+        .skip_hidden(!show_all)
         .follow_links(args.follow_links)
         .max_depth(scan_max_depth)
         .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
         .process_read_dir(move |_depth, path, _state, children| {
+            let current_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                scan_root.join(path)
+            };
             let mut local_sum = 0u64;
+            let mut local_file_count = 0u64;
+            let mut local_dir_count = 0u64;
             let mut stubs = Vec::with_capacity(children.len());
 
             for entry_res in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
+                if no_expand_git
+                    && entry_res.file_type.is_dir()
+                    && entry_res.file_name.to_string_lossy() == ".git"
+                {
+                    entry_res.read_children_path = None;
+                }
+
                 let m = if collect_entry_metadata {
                     entry_res.metadata().ok()
                 } else {
@@ -407,10 +637,15 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
                         }
                     }
                 }
+                if !entry_res.file_type.is_dir() {
+                    local_file_count += 1;
+                } else {
+                    local_dir_count += 1;
+                }
                 
                 stubs.push(EntryStub {
                     name: entry_res.file_name.to_string_lossy().into_owned(),
-                    path: entry_res.path(),
+                    path: current_path.join(&entry_res.file_name),
                     metadata: m,
                     file_type: entry_res.file_type,
                     is_symlink: entry_res.path_is_symlink(),
@@ -418,12 +653,18 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
             }
 
             if !stubs.is_empty() {
-                dc.insert(path.to_path_buf(), stubs);
+                dc.insert(current_path.clone(), stubs);
             }
             // Track every scanned directory so upward aggregation can propagate
             // through directories that have 0 local blocks but non-zero descendants.
             if let Some(ref ds_map) = ds {
-                *ds_map.entry(path.to_path_buf()).or_insert(0) += local_sum;
+                *ds_map.entry(current_path.clone()).or_insert(0) += local_sum;
+            }
+            if let Some(ref dfc_map) = dfc {
+                *dfc_map.entry(current_path.clone()).or_insert(0) += local_file_count;
+            }
+            if let Some(ref ddc_map) = ddc {
+                *ddc_map.entry(current_path).or_insert(0) += local_dir_count;
             }
         })
         .into_iter()
@@ -455,6 +696,56 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
     } else {
         HashMap::with_hasher(FxBuildHasher::default())
     };
+    let true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(dfc) = dir_local_file_counts {
+        let mut true_file_counts: HashMap<PathBuf, u64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        for entry in dfc.iter() {
+            true_file_counts.insert(entry.key().clone(), *entry.value());
+        }
+
+        let mut paths: Vec<_> = true_file_counts.keys().cloned().collect();
+        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                if parent.starts_with(root) || parent == root {
+                    if let Some(&count) = true_file_counts.get(&path) {
+                        if path != root {
+                            *true_file_counts.entry(parent.to_path_buf()).or_insert(0) += count;
+                        }
+                    }
+                }
+            }
+        }
+        true_file_counts
+    } else {
+        HashMap::with_hasher(FxBuildHasher::default())
+    };
+    let true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ddc) = dir_local_dir_counts {
+        let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        for entry in ddc.iter() {
+            true_dir_counts.insert(entry.key().clone(), *entry.value());
+        }
+
+        let mut paths: Vec<_> = true_dir_counts.keys().cloned().collect();
+        paths.sort_unstable_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                if parent.starts_with(root) || parent == root {
+                    if let Some(&count) = true_dir_counts.get(&path) {
+                        if path != root {
+                            *true_dir_counts.entry(parent.to_path_buf()).or_insert(0) += count;
+                        }
+                    }
+                }
+            }
+        }
+        true_dir_counts
+    } else {
+        HashMap::with_hasher(FxBuildHasher::default())
+    };
 
     let mut final_children = HashMap::with_hasher(FxBuildHasher::default());
     // Use Arc's internal DashMap without cloning if possible, or just iterate.
@@ -465,6 +756,8 @@ fn perform_unified_scan(root: &Path, args: &Args, scan_max_depth: usize, collect
     ScanResult {
         dir_children: final_children,
         true_sizes,
+        true_dir_counts,
+        true_file_counts,
     }
 }
 
@@ -476,6 +769,7 @@ fn build_tree_from_cache(
     depth: usize,
     args: &Args,
     scan: &ScanResult,
+    no_expand_git: bool,
 ) -> Option<Node> {
     let is_dir = metadata
         .as_ref()
@@ -489,6 +783,20 @@ fn build_tree_from_cache(
     } else {
         metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
     };
+    let recursive_dir_count = if args.counts && is_dir {
+        scan.true_dir_counts.get(path).copied().unwrap_or(0)
+    } else {
+        0
+    };
+    let recursive_file_count = if args.counts {
+        if is_dir {
+            scan.true_file_counts.get(path).copied().unwrap_or(0)
+        } else {
+            1
+        }
+    } else {
+        0
+    };
 
     let mut node = Node {
         path: path.to_path_buf(),
@@ -497,14 +805,28 @@ fn build_tree_from_cache(
         children: Vec::new(),
         total_children_count: 0,
         omitted_size: 0,
+        omitted_recursive_dir_count: 0,
+        omitted_recursive_file_count: 0,
+        omitted_dirs_count: 0,
+        omitted_files_count: 0,
         is_dir,
         is_symlink,
         true_size,
+        recursive_dir_count,
+        recursive_file_count,
     };
 
-    if is_dir && depth < args.max_depth {
+    let is_git_dir = path
+        .file_name()
+        .map(|name| name == ".git")
+        .unwrap_or(false);
+
+    if is_dir && depth < args.max_depth && !(no_expand_git && is_git_dir) {
         if let Some(stubs) = scan.dir_children.get(path) {
-            let mut entries = stubs.iter().collect::<Vec<_>>();
+            let mut entries = stubs
+                .iter()
+                .filter(|stub| !args.dirs_only || stub.file_type.is_dir())
+                .collect::<Vec<_>>();
 
             let sort_config = args
                 .sort
@@ -514,10 +836,12 @@ fn build_tree_from_cache(
                     _ => None,
                 })
                 .or_else(|| {
-                    if args.sizes {
+                    if args.sizes && !args.times && !args.counts {
                         Some(("size".to_string(), "desc".to_string()))
-                    } else if args.times {
+                    } else if args.times && !args.sizes && !args.counts {
                         Some(("time".to_string(), "desc".to_string()))
+                    } else if args.counts && !args.sizes && !args.times {
+                        Some(("count".to_string(), "desc".to_string()))
                     } else {
                         None
                     }
@@ -544,20 +868,65 @@ fn build_tree_from_cache(
                             let b_time = b.metadata.as_ref().and_then(|m| m.modified().ok());
                             a_time.cmp(&b_time)
                         }
-                        _ => a.name.cmp(&b.name),
+                        "count" | "counts" => {
+                            let a_count = if a.file_type.is_dir() {
+                                scan.true_dir_counts.get(&a.path).copied().unwrap_or(0)
+                                    + scan.true_file_counts.get(&a.path).copied().unwrap_or(0)
+                            } else {
+                                1
+                            };
+                            let b_count = if b.file_type.is_dir() {
+                                scan.true_dir_counts.get(&b.path).copied().unwrap_or(0)
+                                    + scan.true_file_counts.get(&b.path).copied().unwrap_or(0)
+                            } else {
+                                1
+                            };
+                            a_count.cmp(&b_count)
+                        }
+                        _ => cmp_name(&a.name, &b.name),
                     };
                     if order == "desc" { res.reverse() } else { res }
                 });
             } else {
-                // Plain default: type grouping only (directories first), preserve
-                // traversal order within each group.
-                entries.sort_by(|a, b| b.file_type.is_dir().cmp(&a.file_type.is_dir()));
+                // Plain default: type grouping (directories first), then
+                // alphabetical by name within each group.
+                entries.sort_by(|a, b| {
+                    b.file_type
+                        .is_dir()
+                        .cmp(&a.file_type.is_dir())
+                        .then_with(|| cmp_name(&a.name, &b.name))
+                });
             }
 
-            node.total_children_count = entries.len();
-            let limit = if depth == 0 { node.total_children_count } else { node.total_children_count.min(args.trunc) };
+            let filtered_out_count = if args.dirs_only {
+                stubs.len().saturating_sub(entries.len())
+            } else {
+                0
+            };
+            let limit = if depth == 0 { entries.len() } else { entries.len().min(args.trunc) };
+            let omitted_dirs_from_trunc = entries
+                .iter()
+                .skip(limit)
+                .filter(|stub| stub.file_type.is_dir())
+                .count();
+            let omitted_files_from_trunc = entries
+                .iter()
+                .skip(limit)
+                .filter(|stub| !stub.file_type.is_dir())
+                .count();
+            node.total_children_count = if args.dirs_only {
+                entries.len()
+            } else {
+                entries.len() + filtered_out_count
+            };
+            node.omitted_dirs_count = omitted_dirs_from_trunc;
+            node.omitted_files_count = if args.dirs_only {
+                0
+            } else {
+                omitted_files_from_trunc + filtered_out_count
+            };
             node.omitted_size = if args.sizes {
-                entries
+                let truncated_size: u64 = entries
                     .iter()
                     .skip(limit)
                     .map(|stub| {
@@ -567,7 +936,49 @@ fn build_tree_from_cache(
                             stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
                         }
                     })
+                    .sum();
+                let filtered_size: u64 = if args.dirs_only {
+                    0
+                } else {
+                    stubs
+                        .iter()
+                        .filter(|stub| !stub.file_type.is_dir())
+                        .map(|stub| stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0))
+                        .sum()
+                };
+                truncated_size + filtered_size
+            } else {
+                0
+            };
+            node.omitted_recursive_dir_count = if args.counts {
+                entries
+                    .iter()
+                    .skip(limit)
+                    .map(|stub| {
+                        if stub.file_type.is_dir() {
+                            scan.true_dir_counts.get(&stub.path).copied().unwrap_or(0) + 1
+                        } else {
+                            0
+                        }
+                    })
                     .sum()
+            } else {
+                0
+            };
+            node.omitted_recursive_file_count = if args.counts {
+                let truncated_files: u64 = entries
+                    .iter()
+                    .skip(limit)
+                    .map(|stub| {
+                        if stub.file_type.is_dir() {
+                            scan.true_file_counts.get(&stub.path).copied().unwrap_or(0)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
+                let filtered_files: u64 = 0;
+                truncated_files + filtered_files
             } else {
                 0
             };
@@ -581,6 +992,7 @@ fn build_tree_from_cache(
                     depth + 1,
                     args,
                     scan,
+                    no_expand_git,
                 ) {
                     node.children.push(child_node);
                 }
@@ -598,6 +1010,7 @@ fn print_node(
     args: &Args,
     lscolors: &LsColors,
     use_hyperlinks: bool,
+    count_layout: CountColumnLayout,
 ) {
     let child_count = node.children.len();
     let total_count = node.total_children_count;
@@ -618,6 +1031,14 @@ fn print_node(
         if args.times {
             let time_str = child.metadata.as_ref().map(|m| format_time(m)).unwrap_or_else(|| "-".to_string());
             print!("{}{:>16}{} ", date_color, time_str, color_reset);
+        }
+
+        if args.counts {
+            print_recursive_count_pair(
+                child.recursive_dir_count,
+                child.recursive_file_count,
+                count_layout,
+            );
         }
 
         // Print prefix
@@ -678,18 +1099,33 @@ fn print_node(
         if child.is_dir {
             let mut new_prefixes = prefixes.to_vec();
             new_prefixes.push(is_last);
-            print_node(child, depth + 1, &new_prefixes, args, lscolors, use_hyperlinks);
+            print_node(
+                child,
+                depth + 1,
+                &new_prefixes,
+                args,
+                lscolors,
+                use_hyperlinks,
+                count_layout,
+            );
         }
 
     }
 
-    if total_count > child_count {
+    if total_count > child_count && !args.hide_more_count {
         if args.sizes {
             let omitted_size_str = format_size(node.omitted_size);
             print!("{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m");
         }
         if args.times {
             print!("{:>16} ", "");
+        }
+        if args.counts {
+            print_recursive_count_pair(
+                node.omitted_recursive_dir_count,
+                node.omitted_recursive_file_count,
+                count_layout,
+            );
         }
         for &last in prefixes {
             if last {
@@ -698,6 +1134,19 @@ fn print_node(
                 print!("│   ");
             }
         }
-        println!("└── ... and {} more", total_count - child_count);
+        let mut omitted_parts = Vec::new();
+        if node.omitted_dirs_count > 0 {
+            let suffix = if node.omitted_dirs_count == 1 { "dir" } else { "dirs" };
+            omitted_parts.push(format!("{} more {}", node.omitted_dirs_count, suffix));
+        }
+        if node.omitted_files_count > 0 {
+            let suffix = if node.omitted_files_count == 1 { "file" } else { "files" };
+            omitted_parts.push(format!("{} more {}", node.omitted_files_count, suffix));
+        }
+        if omitted_parts.is_empty() {
+            println!("└── ... and {} more", total_count - child_count);
+        } else {
+            println!("└── ... and {}", omitted_parts.join(" "));
+        }
     }
 }

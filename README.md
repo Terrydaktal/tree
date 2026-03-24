@@ -40,19 +40,25 @@ tree [OPTIONS] [PATH]
 
 ### Options
 
-- `-a`: Show hidden files.
+- `-a`: Toggle hidden files visibility (repeat to toggle back; e.g. `-a -a` cancels).
 - `-L <MAX_DEPTH>`: Max depth to display (default: 100).
 - `-F`: Classify (add `/` for dirs, `@` for symlinks, `*` for executables).
 - `-T, --trunc <TRUNC>`: Truncate depth 2+ entries to this value (default: 10).
+- `-M, --hide-more-count`: Hide `... and N more` summary rows.
+- `-d, --dirs-only`: Show directories only.
+- `-G, --no-expand-git`: Toggle `.git/` expansion state (repeat to toggle back; e.g. `-G -G` cancels).
+- `--deep`: Alias for `-L 20 -T 2`.
 - `-s, --sizes`: Show proper recursive directory sizes (like `dust`).
 - `-t, --times`: Show file modification times.
-- `-l`: Alias for `-st` (show sizes and times).
+- `-c, --counts`: Show total recursive counts as `dirs` and `files` columns before the tree.
+- `-l`: Alias for `-stc` (show sizes, times, and counts).
 - `-r, --reverse`: Reverse the final displayed output lines.
 - `-S, --sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
 - Default ordering (without `--sort`) is:
-  - `-s` or `-l`: `size desc`
-  - `-t` (without `-s`): `time desc`
-  - otherwise: type grouping (directories first, then non-directories)
+  - `-s` only: `size desc`
+  - `-t` only: `time desc`
+  - `-c` only: `(dirs + files) desc`
+  - otherwise: type grouping (directories first), then alphabetical by name
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
 - `--hyperlinks`: Enable OSC 8 hyperlinks (off by default).
 - `-h, --help`: Print help.
