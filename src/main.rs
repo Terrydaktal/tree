@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::fs::Metadata;
+use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,16 +59,20 @@ struct Args {
     no_expand_git_toggles: u8,
 
     /// Enable OSC 8 hyperlinks
-    #[arg(long, overrides_with = "hyperlinks")]
-    hyperlinks: bool,
+    #[arg(long, overrides_with = "hyperlink")]
+    hyperlink: bool,
 
     /// Follow symbolic links
-    #[arg(short = 'H', long, overrides_with = "follow_links")]
+    #[arg(short = 'f', long, overrides_with = "follow_links")]
     follow_links: bool,
 
     /// Show proper recursive directory sizes
     #[arg(short = 's', long, overrides_with = "sizes")]
     sizes: bool,
+
+    /// Disable hardlink inode dedup for --sizes (faster, may double-count hardlinks)
+    #[arg(short = 'H', long = "no-dedupe-hardlinks", overrides_with = "no_dedupe_hardlinks")]
+    no_dedupe_hardlinks: bool,
 
     /// Show file modification times
     #[arg(short = 't', long, overrides_with = "times")]
@@ -89,8 +94,8 @@ struct Args {
     #[arg(long, overrides_with = "cache_raw")]
     cache_raw: bool,
 
-    /// Sort all levels by field and order (e.g. -S size desc)
-    #[arg(short = 'S', long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
+    /// Sort all levels by field and order (e.g. --sort size desc)
+    #[arg(long, num_args = 2, value_names = ["FIELD", "ORDER"], overrides_with = "sort")]
     sort: Option<Vec<String>>,
 
     /// Number of threads to use
@@ -105,15 +110,15 @@ fn format_size(bytes: u64) -> String {
     const TIB: u64 = GIB * 1024;
 
     if bytes >= TIB {
-        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+        format!("{:.1}T", bytes as f64 / TIB as f64)
     } else if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        format!("{:.1}G", bytes as f64 / GIB as f64)
     } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+        format!("{:.1}M", bytes as f64 / MIB as f64)
     } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+        format!("{:.1}K", bytes as f64 / KIB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{}B", bytes)
     }
 }
 
@@ -154,25 +159,27 @@ impl CountColumnLayout {
     }
 }
 
-fn print_recursive_count_pair(
+fn write_recursive_count_pair(
+    out: &mut dyn Write,
     dir_count: u64,
     file_count: u64,
     count_layout: CountColumnLayout,
-) {
+) -> io::Result<()> {
     let dir_str = format_count(dir_count);
     let file_str = format_count(file_count);
     let count_color = "\x1b[1;33m";
     let color_reset = "\x1b[0m";
-    print!("{}{}{}d", count_color, dir_str, color_reset);
+    write!(out, "{}{}{}d", count_color, dir_str, color_reset)?;
     if count_layout.dir_width > dir_str.len() {
-        print!("{:width$}", "", width = count_layout.dir_width - dir_str.len());
+        write!(out, "{:width$}", "", width = count_layout.dir_width - dir_str.len())?;
     }
-    print!(" ");
-    print!("{}{}{}f", count_color, file_str, color_reset);
+    write!(out, " ")?;
+    write!(out, "{}{}{}f", count_color, file_str, color_reset)?;
     if count_layout.file_width > file_str.len() {
-        print!("{:width$}", "", width = count_layout.file_width - file_str.len());
+        write!(out, "{:width$}", "", width = count_layout.file_width - file_str.len())?;
     }
-    print!(" ");
+    write!(out, " ")?;
+    Ok(())
 }
 
 fn compute_count_column_layout(node: &Node, args: &Args) -> CountColumnLayout {
@@ -322,6 +329,51 @@ fn metadata_required(args: &Args) -> bool {
         || sort_requires_metadata(&args.sort)
 }
 
+fn use_shallow_size_fast_path(args: &Args) -> bool {
+    args.sizes
+        && !args.counts
+        && !args.times
+        && (args.max_depth == 1 || args.max_depth == 2)
+}
+
+fn shallow_visible_ancestors(
+    root: &Path,
+    current_path: &Path,
+    depth: usize,
+    max_depth: usize,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    if depth == 0 {
+        return (None, None);
+    }
+    if depth == 1 {
+        return (Some(current_path.to_path_buf()), None);
+    }
+
+    let rel = match current_path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => return (None, None),
+    };
+    let mut comps = rel.components();
+    let first = comps.next().map(|c| c.as_os_str().to_os_string());
+    let second = comps.next().map(|c| c.as_os_str().to_os_string());
+
+    let depth1 = first.as_ref().map(|component| root.join(component));
+    let depth2 = if max_depth >= 2 {
+        if depth == 2 {
+            Some(current_path.to_path_buf())
+        } else {
+            match (first.as_ref(), second.as_ref()) {
+                (Some(first), Some(second)) => Some(root.join(first).join(second)),
+                _ => None,
+            }
+        }
+    } else {
+        None
+    };
+
+    (depth1, depth2)
+}
+
 fn main() {
     let mut args = Args::parse();
     const REVERSE_ENV_KEY: &str = "TREE_INTERNAL_REVERSE";
@@ -387,16 +439,33 @@ fn main() {
             let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
             let mut i = 0usize;
             while i < bytes.len() {
-                if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                    i += 2;
-                    while i < bytes.len() {
-                        let b = bytes[i];
-                        i += 1;
-                        if b.is_ascii_alphabetic() {
-                            break;
+                if bytes[i] == 0x1b && i + 1 < bytes.len() {
+                    if bytes[i + 1] == b'[' {
+                        i += 2;
+                        while i < bytes.len() {
+                            let b = bytes[i];
+                            i += 1;
+                            if b.is_ascii_alphabetic() {
+                                break;
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    if bytes[i + 1] == b']' {
+                        i += 2;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        continue;
+                    }
                 }
                 out.push(bytes[i]);
                 i += 1;
@@ -477,7 +546,11 @@ fn main() {
 
         // Replace reversed root marker '.' with an interpunct.
         if let Some(last) = reversed.last_mut() {
-            if strip_ansi(last).trim() == "." {
+            let plain = strip_ansi(last);
+            let trimmed = plain.trim();
+            let is_root_marker = trimmed == "."
+                || (!trimmed.contains("──") && trimmed.split_whitespace().last() == Some("."));
+            if is_root_marker {
                 *last = if prefix_base > 0 {
                     format!("{:width$}·", "", width = prefix_base)
                 } else {
@@ -499,36 +572,41 @@ fn main() {
         .build_global();
 
     let lscolors = LsColors::from_env().unwrap_or_default();
-    let use_hyperlinks = args.hyperlinks;
+    let use_hyperlinks = args.hyperlink;
 
     let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let root_abs = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
     let need_metadata = metadata_required(&args);
-    
-    // PHASE 1: Single Unified Parallel Scan
-    // `-L` caps scan depth unless recursive aggregates are requested.
-    let mut scan_max_depth = if args.sizes || args.counts {
-        usize::MAX
+    let use_shallow_size_path = use_shallow_size_fast_path(&args);
+
+    // PHASE 1: Scan
+    let scan = if use_shallow_size_path {
+        perform_shallow_size_scan(&root_abs, &args, show_all, no_expand_git)
     } else {
-        args.max_depth
-    };
-    if no_expand_git {
-        if root_abs
-            .file_name()
-            .map(|name| name == ".git")
-            .unwrap_or(false)
-        {
-            scan_max_depth = 0;
+        // `-L` caps scan depth unless recursive aggregates are requested.
+        let mut scan_max_depth = if args.sizes || args.counts {
+            usize::MAX
+        } else {
+            args.max_depth
+        };
+        if no_expand_git {
+            if root_abs
+                .file_name()
+                .map(|name| name == ".git")
+                .unwrap_or(false)
+            {
+                scan_max_depth = 0;
+            }
         }
-    }
-    let scan = perform_unified_scan(
-        &root_abs,
-        &args,
-        scan_max_depth,
-        need_metadata,
-        show_all,
-        no_expand_git,
-    );
+        perform_unified_scan(
+            &root_abs,
+            &args,
+            scan_max_depth,
+            need_metadata,
+            show_all,
+            no_expand_git,
+        )
+    };
 
     let root_metadata = if need_metadata {
         if args.follow_links {
@@ -568,16 +646,6 @@ fn main() {
         }
     };
 
-    let root_label = root_path.display().to_string();
-    if args.counts || args.sizes || args.times {
-        let prefix_base = (if args.counts { count_layout.pair_width() + 1 } else { 0 })
-            + (if args.sizes { 11 } else { 0 })
-            + (if args.times { 17 } else { 0 });
-        println!("{:width$}{}", "", root_label, width = prefix_base);
-    } else {
-        println!("{}", root_label);
-    }
-
     let mut shown_dir_paths: Vec<PathBuf> = Vec::new();
     let mut shown_file_paths: Vec<PathBuf> = Vec::new();
     if args.cache_raw {
@@ -595,8 +663,41 @@ fn main() {
         }
     }
 
+    let root_label = root_path.display().to_string();
+    let root_display = if use_hyperlinks {
+        if let Ok(url) = Url::from_file_path(&root_abs) {
+            format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, root_label)
+        } else {
+            root_label
+        }
+    } else {
+        root_label
+    };
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    let root_write_result = (|| -> io::Result<()> {
+        if args.counts {
+            write!(out, "{:width$}", "", width = count_layout.pair_width() + 1)?;
+        }
+        if args.sizes {
+            let root_size = root_node
+                .as_ref()
+                .map(|n| n.true_size)
+                .unwrap_or(0);
+            let size_str = format_size(root_size);
+            write!(out, "{}{:>10}{} ", "\x1b[1;36m", size_str, "\x1b[0m")?;
+        }
+        if args.times {
+            write!(out, "{:>17}", "")?;
+        }
+        writeln!(out, "{}", root_display)
+    })();
+    if let Err(err) = root_write_result {
+        eprintln!("failed to render output: {}", err);
+    }
+
     if let Some(root_node) = root_node {
-        print_node(
+        if let Err(err) = print_node(
+            &mut out,
             &root_node,
             0,
             &Vec::new(),
@@ -606,7 +707,9 @@ fn main() {
             count_layout,
             &mut shown_dir_paths,
             &mut shown_file_paths,
-        );
+        ) {
+            eprintln!("failed to render output: {}", err);
+        }
 
         if args.cache_raw {
             if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
@@ -617,6 +720,159 @@ fn main() {
         if let Err(err) = write_cache_raw_paths(&shown_dir_paths, &shown_file_paths) {
             eprintln!("failed to write --cache-raw file: {}", err);
         }
+    }
+
+    if let Err(err) = out.flush() {
+        eprintln!("failed to flush output: {}", err);
+    }
+}
+
+fn perform_shallow_size_scan(
+    root: &Path,
+    args: &Args,
+    show_all: bool,
+    no_expand_git: bool,
+) -> ScanResult {
+    let dir_children = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+    let true_sizes = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+    let use_inode_dedup = !args.no_dedupe_hardlinks;
+    let seen_inodes = if use_inode_dedup {
+        Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    let seen_dir_inodes = if args.follow_links {
+        Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
+    } else {
+        None
+    };
+    if let Ok(root_meta) = root.symlink_metadata() {
+        true_sizes.insert(root.to_path_buf(), root_meta.blocks() * 512);
+    }
+
+    let dc = Arc::clone(&dir_children);
+    let ts = Arc::clone(&true_sizes);
+    let si = seen_inodes.as_ref().map(Arc::clone);
+    let sdi = seen_dir_inodes.as_ref().map(Arc::clone);
+    let follow_links = args.follow_links;
+    let render_max_depth = args.max_depth;
+    let logical_max_depth = args.max_depth;
+    let scan_root = root.to_path_buf();
+    let root_scan_max_depth = if no_expand_git
+        && scan_root
+            .file_name()
+            .map(|name| name == ".git")
+            .unwrap_or(false)
+    {
+        0
+    } else {
+        usize::MAX
+    };
+
+    WalkDir::new(root)
+        .skip_hidden(!show_all)
+        .follow_links(args.follow_links)
+        .max_depth(root_scan_max_depth)
+        .parallelism(jwalk::Parallelism::RayonNewPool(args.threads))
+        .process_read_dir(move |depth, path, _state, children| {
+            let depth = depth.unwrap_or(0);
+            let current_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                scan_root.join(path)
+            };
+            let (visible_depth1, visible_depth2) =
+                shallow_visible_ancestors(&scan_root, &current_path, depth, logical_max_depth);
+
+            let should_cache_children = depth < render_max_depth;
+            let mut stubs = if should_cache_children {
+                Some(Vec::with_capacity(children.len()))
+            } else {
+                None
+            };
+
+            for entry_res in children.iter_mut().filter_map(|e| e.as_mut().ok()) {
+                if no_expand_git
+                    && entry_res.file_type.is_dir()
+                    && entry_res.file_name.to_string_lossy() == ".git"
+                {
+                    entry_res.read_children_path = None;
+                }
+
+                let metadata = entry_res.metadata().ok();
+
+                if follow_links && entry_res.file_type.is_dir() {
+                    if let Some(ref md) = metadata {
+                        if let Some(ref sdi_map) = sdi {
+                            if !sdi_map.insert((md.dev(), md.ino())) {
+                                entry_res.read_children_path = None;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref md) = metadata {
+                    let include_size = if let Some(ref si_map) = si {
+                        if !entry_res.file_type.is_dir() && md.nlink() > 1 {
+                            si_map.insert((md.dev(), md.ino()))
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if include_size {
+                        let contribution = md.blocks() * 512;
+                        *ts.entry(scan_root.clone()).or_insert(0) += contribution;
+                        if let Some(ref depth1_path) = visible_depth1 {
+                            *ts.entry(depth1_path.clone()).or_insert(0) += contribution;
+                        }
+                        if let Some(ref depth2_path) = visible_depth2 {
+                            *ts.entry(depth2_path.clone()).or_insert(0) += contribution;
+                        }
+                    }
+                }
+
+                if let Some(ref mut stubs_vec) = stubs {
+                    stubs_vec.push(EntryStub {
+                        name: entry_res.file_name.to_string_lossy().into_owned(),
+                        path: current_path.join(&entry_res.file_name),
+                        metadata,
+                        file_type: entry_res.file_type,
+                        is_symlink: entry_res.path_is_symlink(),
+                    });
+                }
+            }
+
+            if let Some(stubs_vec) = stubs {
+                if !stubs_vec.is_empty() {
+                    dc.insert(current_path, stubs_vec);
+                }
+            }
+        })
+        .into_iter()
+        .for_each(|_| {});
+
+    let dir_children = match Arc::try_unwrap(dir_children) {
+        Ok(map) => map.into_iter().collect(),
+        Err(map) => map
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect(),
+    };
+    let true_sizes = match Arc::try_unwrap(true_sizes) {
+        Ok(map) => map.into_iter().collect(),
+        Err(map) => map
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect(),
+    };
+
+    ScanResult {
+        dir_children,
+        true_sizes,
+        true_dir_counts: HashMap::with_hasher(FxBuildHasher::default()),
+        true_file_counts: HashMap::with_hasher(FxBuildHasher::default()),
     }
 }
 
@@ -647,7 +903,7 @@ fn perform_unified_scan(
     } else {
         None
     };
-    let seen_inodes = if collect_recursive_sizes {
+    let seen_inodes = if collect_recursive_sizes && !args.no_dedupe_hardlinks {
         Some(Arc::new(DashSet::with_hasher(FxBuildHasher::default())))
     } else {
         None
@@ -661,9 +917,6 @@ fn perform_unified_scan(
     // Seed root size and file-count accumulation.
     if collect_recursive_sizes {
         if let Ok(m) = root.symlink_metadata() {
-            if let Some(ref si) = seen_inodes {
-                si.insert((m.dev(), m.ino()));
-            }
             if let Some(ref ds) = dir_local_sizes {
                 ds.insert(root.to_path_buf(), m.blocks() * 512);
             }
@@ -734,9 +987,15 @@ fn perform_unified_scan(
 
                 if let Some(ref metadata) = m {
                     if let Some(ref si_map) = si {
-                        if si_map.insert((metadata.dev(), metadata.ino())) {
+                        if !entry_res.file_type.is_dir() && metadata.nlink() > 1 {
+                            if si_map.insert((metadata.dev(), metadata.ino())) {
+                                local_sum += metadata.blocks() * 512;
+                            }
+                        } else {
                             local_sum += metadata.blocks() * 512;
                         }
+                    } else {
+                        local_sum += metadata.blocks() * 512;
                     }
                 }
                 if !entry_res.file_type.is_dir() {
@@ -1098,8 +1357,9 @@ fn build_tree_from_cache(
 }
 
 fn print_node(
+    out: &mut dyn Write,
     node: &Node,
-    depth: usize,
+    _depth: usize,
     prefixes: &[bool],
     args: &Args,
     lscolors: &LsColors,
@@ -1107,7 +1367,7 @@ fn print_node(
     count_layout: CountColumnLayout,
     shown_dir_paths: &mut Vec<PathBuf>,
     shown_file_paths: &mut Vec<PathBuf>,
-) {
+) -> io::Result<()> {
     let child_count = node.children.len();
     let total_count = node.total_children_count;
 
@@ -1121,35 +1381,36 @@ fn print_node(
         if args.sizes {
             let display_size = child.true_size;
             let size_str = format_size(display_size);
-            print!("{}{:>10}{} ", size_color, size_str, color_reset);
+            write!(out, "{}{:>10}{} ", size_color, size_str, color_reset)?;
         }
 
         if args.times {
             let time_str = child.metadata.as_ref().map(|m| format_time(m)).unwrap_or_else(|| "-".to_string());
-            print!("{}{:>16}{} ", date_color, time_str, color_reset);
+            write!(out, "{}{:>16}{} ", date_color, time_str, color_reset)?;
         }
 
         if args.counts {
-            print_recursive_count_pair(
+            write_recursive_count_pair(
+                out,
                 child.recursive_dir_count,
                 child.recursive_file_count,
                 count_layout,
-            );
+            )?;
         }
 
         // Print prefix
         for &last in prefixes {
             if last {
-                print!("    ");
+                write!(out, "    ")?;
             } else {
-                print!("│   ");
+                write!(out, "│   ")?;
             }
         }
 
         if is_last {
-            print!("└── ");
+            write!(out, "└── ")?;
         } else {
-            print!("├── ");
+            write!(out, "├── ")?;
         }
 
         // Styling
@@ -1185,17 +1446,17 @@ fn print_node(
         if use_hyperlinks {
             if let Ok(abs_path) = std::fs::canonicalize(&child.path) {
                 if let Ok(url) = Url::from_file_path(&abs_path) {
-                    print!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, colored_name);
+                    write!(out, "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, colored_name)?;
                 } else {
-                    print!("{}", colored_name);
+                    write!(out, "{}", colored_name)?;
                 }
             } else {
-                print!("{}", colored_name);
+                write!(out, "{}", colored_name)?;
             }
         } else {
-            print!("{}", colored_name);
+            write!(out, "{}", colored_name)?;
         }
-        println!();
+        writeln!(out)?;
         if args.cache_raw {
             if child.is_dir {
                 shown_dir_paths.push(child.path.clone());
@@ -1208,8 +1469,9 @@ fn print_node(
             let mut new_prefixes = prefixes.to_vec();
             new_prefixes.push(is_last);
             print_node(
+                out,
                 child,
-                depth + 1,
+                _depth + 1,
                 &new_prefixes,
                 args,
                 lscolors,
@@ -1217,7 +1479,7 @@ fn print_node(
                 count_layout,
                 shown_dir_paths,
                 shown_file_paths,
-            );
+            )?;
         }
 
     }
@@ -1225,23 +1487,24 @@ fn print_node(
     if total_count > child_count && !args.hide_more_count {
         if args.sizes {
             let omitted_size_str = format_size(node.omitted_size);
-            print!("{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m");
+            write!(out, "{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m")?;
         }
         if args.times {
-            print!("{:>16} ", "");
+            write!(out, "{:>16} ", "")?;
         }
         if args.counts {
-            print_recursive_count_pair(
+            write_recursive_count_pair(
+                out,
                 node.omitted_recursive_dir_count,
                 node.omitted_recursive_file_count,
                 count_layout,
-            );
+            )?;
         }
         for &last in prefixes {
             if last {
-                print!("    ");
+                write!(out, "    ")?;
             } else {
-                print!("│   ");
+                write!(out, "│   ")?;
             }
         }
         let mut omitted_parts = Vec::new();
@@ -1254,9 +1517,10 @@ fn print_node(
             omitted_parts.push(format!("{} more {}", node.omitted_files_count, suffix));
         }
         if omitted_parts.is_empty() {
-            println!("└── ... and {} more", total_count - child_count);
+            writeln!(out, "└── ... and {} more", total_count - child_count)?;
         } else {
-            println!("└── ... and {}", omitted_parts.join(" "));
+            writeln!(out, "└── ... and {}", omitted_parts.join(" "))?;
         }
     }
+    Ok(())
 }
