@@ -374,8 +374,70 @@ fn shallow_visible_ancestors(
     (depth1, depth2)
 }
 
+fn parse_args_with_depth_shorthand() -> Args {
+    let mut raw_args: Vec<OsString> = std::env::args_os().collect();
+    if raw_args.len() >= 2 {
+        let mut positional_indices: Vec<usize> = Vec::new();
+        let mut shorthand_candidate: Option<usize> = None;
+        let mut i = 1usize;
+        let mut after_double_dash = false;
+
+        while i < raw_args.len() {
+            let arg = raw_args[i].to_string_lossy();
+
+            if !after_double_dash {
+                if arg == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+
+                // Options with value(s)
+                if arg == "-L" || arg == "--max-depth" || arg == "-T" || arg == "--trunc" || arg == "-j" || arg == "--threads" {
+                    i += 2;
+                    continue;
+                }
+                if arg == "--sort" {
+                    i += 3;
+                    continue;
+                }
+                if arg.starts_with("--max-depth=")
+                    || arg.starts_with("--trunc=")
+                    || arg.starts_with("--threads=")
+                {
+                    i += 1;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            positional_indices.push(i);
+            if !after_double_dash
+                && !arg.is_empty()
+                && arg.chars().all(|c| c.is_ascii_digit())
+            {
+                shorthand_candidate = Some(i);
+            }
+            i += 1;
+        }
+
+        // If the only positional arg is numeric, treat it as -L shorthand.
+        // Use `-- 3` to force numeric path literal.
+        if positional_indices.len() == 1 && shorthand_candidate == Some(positional_indices[0]) {
+            let idx = positional_indices[0];
+            let depth = raw_args.remove(idx);
+            raw_args.push(OsString::from("-L"));
+            raw_args.push(depth);
+        }
+    }
+    Args::parse_from(raw_args)
+}
+
 fn main() {
-    let mut args = Args::parse();
+    let mut args = parse_args_with_depth_shorthand();
     const REVERSE_ENV_KEY: &str = "TREE_INTERNAL_REVERSE";
 
     if args.long_listing {
@@ -1413,13 +1475,28 @@ fn print_node(
             write!(out, "├── ")?;
         }
 
+        let is_exec_file = !child.is_dir
+            && !child.is_symlink
+            && child
+                .metadata
+                .as_ref()
+                .map(|md| md.permissions().mode() & 0o111 != 0)
+                .unwrap_or_else(|| is_executable_path(&child.path));
+
         // Styling
         let style = if child.is_symlink {
             lscolors.style_for_path(&child.path)
-        } else if let Some(m) = child.metadata.as_ref() {
-            lscolors.style_for_path_with_metadata(&child.path, Some(m))
+        } else if child.is_dir {
+            if let Some(m) = child.metadata.as_ref() {
+                lscolors.style_for_path_with_metadata(&child.path, Some(m))
+            } else {
+                lscolors.style_for_path(&child.path)
+            }
         } else {
-            lscolors.style_for_path(&child.path)
+            // For regular files (including executables), prefer suffix mapping first.
+            lscolors
+                .style_for_str(&child.name)
+                .or_else(|| lscolors.style_for_indicator(lscolors::Indicator::RegularFile))
         };
         let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();
 
@@ -1430,18 +1507,18 @@ fn print_node(
             } else if child.is_dir {
                 display_name.push('/');
             } else {
-                let is_exec = child
-                    .metadata
-                    .as_ref()
-                    .map(|md| md.permissions().mode() & 0o111 != 0)
-                    .unwrap_or_else(|| is_executable_path(&child.path));
-                if is_exec {
+                if is_exec_file {
                     display_name.push('*');
                 }
             }
         }
 
-        let colored_name = ansi_style.paint(&display_name);
+        let is_extensionless_exec = is_exec_file && child.path.extension().is_none();
+        let colored_name = if is_extensionless_exec {
+            format!("\x1b[38;2;0;245;200m{}\x1b[0m", display_name)
+        } else {
+            ansi_style.paint(&display_name).to_string()
+        };
 
         if use_hyperlinks {
             if let Ok(abs_path) = std::fs::canonicalize(&child.path) {

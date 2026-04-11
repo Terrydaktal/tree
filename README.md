@@ -42,7 +42,7 @@ tree [OPTIONS] [PATH]
 ### Options
 
 - `-a`: Toggle hidden files visibility (repeat to toggle back; e.g. `-a -a` cancels).
-- `-L <MAX_DEPTH>`: Max depth to display (default: 100).
+- `-L <MAX_DEPTH>`: Max depth to display (default: 100). A lone numeric positional arg is accepted as shorthand (e.g. `tree 3` or `tree -L 2 3` uses depth `3`). Use `tree -- 3` to force path `3`.
 - `-F`: Classify (add `/` for dirs, `@` for symlinks, `*` for executables).
 - `-T, --trunc <TRUNC>`: Truncate depth 2+ entries to this value (default: 10).
 - `-M, --hide-more-count`: Hide `... and N more` summary rows.
