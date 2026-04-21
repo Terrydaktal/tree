@@ -67,7 +67,7 @@ struct Args {
     follow_links: bool,
 
     /// Show proper recursive directory sizes
-    #[arg(short = 's', long, overrides_with = "sizes")]
+    #[arg(short = 'S', long, overrides_with = "sizes")]
     sizes: bool,
 
     /// Disable hardlink inode dedup for --sizes (faster, may double-count hardlinks)
@@ -82,7 +82,7 @@ struct Args {
     #[arg(short = 'c', long, overrides_with = "counts")]
     counts: bool,
 
-    /// Alias for -stc (show sizes, times, and counts)
+    /// Alias for -Stc (show sizes, times, and counts)
     #[arg(short = 'l', overrides_with = "long_listing")]
     long_listing: bool,
 
@@ -121,6 +121,8 @@ fn format_size(bytes: u64) -> String {
         format!("{}B", bytes)
     }
 }
+
+const SIZE_COL_WIDTH: usize = 7; // fits "1000.0K"
 
 fn format_time(metadata: &Metadata) -> String {
     if let Ok(mtime) = metadata.modified() {
@@ -746,7 +748,7 @@ fn main() {
                 .map(|n| n.true_size)
                 .unwrap_or(0);
             let size_str = format_size(root_size);
-            write!(out, "{}{:>10}{} ", "\x1b[1;36m", size_str, "\x1b[0m")?;
+            write!(out, "{}{:>width$}{} ", "\x1b[1;36m", size_str, "\x1b[0m", width = SIZE_COL_WIDTH)?;
         }
         if args.times {
             write!(out, "{:>17}", "")?;
@@ -1443,7 +1445,7 @@ fn print_node(
         if args.sizes {
             let display_size = child.true_size;
             let size_str = format_size(display_size);
-            write!(out, "{}{:>10}{} ", size_color, size_str, color_reset)?;
+            write!(out, "{}{:>width$}{} ", size_color, size_str, color_reset, width = SIZE_COL_WIDTH)?;
         }
 
         if args.times {
@@ -1564,7 +1566,7 @@ fn print_node(
     if total_count > child_count && !args.hide_more_count {
         if args.sizes {
             let omitted_size_str = format_size(node.omitted_size);
-            write!(out, "{}{:>10}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m")?;
+            write!(out, "{}{:>width$}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m", width = SIZE_COL_WIDTH)?;
         }
         if args.times {
             write!(out, "{:>16} ", "")?;

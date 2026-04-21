@@ -50,18 +50,18 @@ tree [OPTIONS] [PATH]
 - `-G, --no-expand-git`: Toggle `.git/` expansion state (repeat to toggle back; e.g. `-G -G` cancels).
 - `--deep`: Alias for `-L 20 -T 2`.
 - `-f, --follow-links`: Follow symbolic links.
-- `-s, --sizes`: Show proper recursive directory sizes (like `dust`).
+- `-S, --sizes`: Show proper recursive directory sizes (like `dust`).
 - `-H, --no-dedupe-hardlinks`: Disable inode dedup for `--sizes` (faster, may double-count hardlinks).
 - `-t, --times`: Show file modification times.
 - `-c, --counts`: Show total recursive counts as `dirs` and `files` columns before the tree.
-- `-l`: Alias for `-stc` (show sizes, times, and counts).
+- `-l`: Alias for `-Stc` (show sizes, times, and counts).
 - `-r, --reverse`: Reverse the final displayed output lines.
 - `--cache-raw`: Write shown full paths to session-scoped files in `/tmp/fzf-history-$USER/`:
   - `universal-last-dirs-<pid>`
   - `universal-last-files-<pid>`
 - `--sort <FIELD> <ORDER>`: Sort all levels by `name`, `size`, or `time` in `asc` or `desc` order.
 - Default ordering (without `--sort`) is:
-  - `-s` only: `size desc`
+  - `-S` only: `size desc`
   - `-t` only: `time desc`
   - `-c` only: `(dirs + files) desc`
   - otherwise: type grouping (directories first), then alphabetical by name
