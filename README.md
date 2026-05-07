@@ -66,7 +66,8 @@ tree [OPTIONS] [PATH]
   - `-c` only: `(dirs + files) desc`
   - otherwise: type grouping (directories first), then alphabetical by name
 - `-j, --threads <THREADS>`: Number of threads to use (default: 8).
-- `--hyperlink`: Enable OSC 8 hyperlinks (off by default).
+- `--color[=always|auto|never]`: Control ANSI color output (default: `never`; bare `--color` means `always`).
+- `--hyperlink[=always|auto|never]`: Control OSC 8 hyperlinks (default: `auto`; bare `--hyperlink` means `always`).
 - `-h, --help`: Print help.
 - `-V, --version`: Print version.
 

@@ -1,12 +1,13 @@
 use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dashmap::{DashMap, DashSet};
+use is_terminal::IsTerminal;
 use jwalk::WalkDir;
 use lscolors::LsColors;
 use rustc_hash::FxBuildHasher;
-use std::ffi::OsString;
-use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::Metadata;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -43,7 +44,11 @@ struct Args {
     trunc: usize,
 
     /// Hide the "... and N more" summary rows
-    #[arg(short = 'M', long = "hide-more-count", overrides_with = "hide_more_count")]
+    #[arg(
+        short = 'M',
+        long = "hide-more-count",
+        overrides_with = "hide_more_count"
+    )]
     hide_more_count: bool,
 
     /// Alias for -L 20 -T 2
@@ -58,9 +63,13 @@ struct Args {
     #[arg(short = 'G', long = "no-expand-git", action = clap::ArgAction::Count)]
     no_expand_git_toggles: u8,
 
-    /// Enable OSC 8 hyperlinks
-    #[arg(long, overrides_with = "hyperlink")]
-    hyperlink: bool,
+    /// Control color output [always, auto, never]
+    #[arg(long, value_enum, default_value_t = OutputMode::Never, num_args = 0..=1, default_missing_value = "always", overrides_with = "color")]
+    color: OutputMode,
+
+    /// Control OSC 8 hyperlink output [always, auto, never]
+    #[arg(long, value_enum, default_value_t = OutputMode::Auto, num_args = 0..=1, default_missing_value = "always", overrides_with = "hyperlink")]
+    hyperlink: OutputMode,
 
     /// Follow symbolic links
     #[arg(short = 'f', long, overrides_with = "follow_links")]
@@ -71,7 +80,11 @@ struct Args {
     sizes: bool,
 
     /// Disable hardlink inode dedup for --sizes (faster, may double-count hardlinks)
-    #[arg(short = 'H', long = "no-dedupe-hardlinks", overrides_with = "no_dedupe_hardlinks")]
+    #[arg(
+        short = 'H',
+        long = "no-dedupe-hardlinks",
+        overrides_with = "no_dedupe_hardlinks"
+    )]
     no_dedupe_hardlinks: bool,
 
     /// Show file modification times
@@ -101,6 +114,21 @@ struct Args {
     /// Number of threads to use
     #[arg(short = 'j', long, default_value = "8", overrides_with = "threads")]
     threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputMode {
+    Always,
+    Auto,
+    Never,
+}
+
+fn output_mode_enabled(mode: OutputMode, is_tty: bool) -> bool {
+    match mode {
+        OutputMode::Always => true,
+        OutputMode::Auto => is_tty,
+        OutputMode::Never => false,
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -166,19 +194,40 @@ fn write_recursive_count_pair(
     dir_count: u64,
     file_count: u64,
     count_layout: CountColumnLayout,
+    use_colors: bool,
 ) -> io::Result<()> {
     let dir_str = format_count(dir_count);
     let file_str = format_count(file_count);
-    let count_color = "\x1b[1;33m";
-    let color_reset = "\x1b[0m";
-    write!(out, "{}{}{}d", count_color, dir_str, color_reset)?;
+    if use_colors {
+        let count_color = "\x1b[1;33m";
+        let color_reset = "\x1b[0m";
+        write!(out, "{}{}{}d", count_color, dir_str, color_reset)?;
+    } else {
+        write!(out, "{}d", dir_str)?;
+    }
     if count_layout.dir_width > dir_str.len() {
-        write!(out, "{:width$}", "", width = count_layout.dir_width - dir_str.len())?;
+        write!(
+            out,
+            "{:width$}",
+            "",
+            width = count_layout.dir_width - dir_str.len()
+        )?;
     }
     write!(out, " ")?;
-    write!(out, "{}{}{}f", count_color, file_str, color_reset)?;
+    if use_colors {
+        let count_color = "\x1b[1;33m";
+        let color_reset = "\x1b[0m";
+        write!(out, "{}{}{}f", count_color, file_str, color_reset)?;
+    } else {
+        write!(out, "{}f", file_str)?;
+    }
     if count_layout.file_width > file_str.len() {
-        write!(out, "{:width$}", "", width = count_layout.file_width - file_str.len())?;
+        write!(
+            out,
+            "{:width$}",
+            "",
+            width = count_layout.file_width - file_str.len()
+        )?;
     }
     write!(out, " ")?;
     Ok(())
@@ -320,22 +369,21 @@ struct ScanResult {
 fn sort_requires_metadata(sort: &Option<Vec<String>>) -> bool {
     sort.as_ref()
         .and_then(|v| v.first())
-        .map(|field| matches!(field.to_ascii_lowercase().as_str(), "size" | "time" | "date" | "mtime"))
+        .map(|field| {
+            matches!(
+                field.to_ascii_lowercase().as_str(),
+                "size" | "time" | "date" | "mtime"
+            )
+        })
         .unwrap_or(false)
 }
 
 fn metadata_required(args: &Args) -> bool {
-    args.sizes
-        || args.times
-        || args.follow_links
-        || sort_requires_metadata(&args.sort)
+    args.sizes || args.times || args.follow_links || sort_requires_metadata(&args.sort)
 }
 
 fn use_shallow_size_fast_path(args: &Args) -> bool {
-    args.sizes
-        && !args.counts
-        && !args.times
-        && (args.max_depth == 1 || args.max_depth == 2)
+    args.sizes && !args.counts && !args.times && (args.max_depth == 1 || args.max_depth == 2)
 }
 
 fn shallow_visible_ancestors(
@@ -395,7 +443,13 @@ fn parse_args_with_depth_shorthand() -> Args {
                 }
 
                 // Options with value(s)
-                if arg == "-L" || arg == "--max-depth" || arg == "-T" || arg == "--trunc" || arg == "-j" || arg == "--threads" {
+                if arg == "-L"
+                    || arg == "--max-depth"
+                    || arg == "-T"
+                    || arg == "--trunc"
+                    || arg == "-j"
+                    || arg == "--threads"
+                {
                     i += 2;
                     continue;
                 }
@@ -417,10 +471,7 @@ fn parse_args_with_depth_shorthand() -> Args {
             }
 
             positional_indices.push(i);
-            if !after_double_dash
-                && !arg.is_empty()
-                && arg.chars().all(|c| c.is_ascii_digit())
-            {
+            if !after_double_dash && !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit()) {
                 shorthand_candidate = Some(i);
             }
             i += 1;
@@ -464,16 +515,24 @@ fn main() {
         args.trunc = 2;
     }
 
+    let stdout_is_tty = io::stdout().is_terminal();
+    let use_colors = output_mode_enabled(args.color, stdout_is_tty);
+    let use_hyperlinks = output_mode_enabled(args.hyperlink, stdout_is_tty);
+
     if args.reverse && std::env::var_os(REVERSE_ENV_KEY).is_none() {
         let exe = std::env::current_exe().expect("failed to resolve current executable");
-        let forwarded_args: Vec<OsString> = std::env::args_os()
+        let mut forwarded_args: Vec<OsString> = std::env::args_os()
             .skip(1)
             .filter_map(|arg| {
                 let text = arg.to_string_lossy();
                 if text == "-r" || text == "--reverse" {
                     return None;
                 }
-                if text.starts_with('-') && !text.starts_with("--") && text.len() > 2 && text.contains('r') {
+                if text.starts_with('-')
+                    && !text.starts_with("--")
+                    && text.len() > 2
+                    && text.contains('r')
+                {
                     let kept: String = text[1..].chars().filter(|&c| c != 'r').collect();
                     if kept.is_empty() {
                         None
@@ -485,6 +544,16 @@ fn main() {
                 }
             })
             .collect();
+        forwarded_args.push(OsString::from(if use_colors {
+            "--color=always"
+        } else {
+            "--color=never"
+        }));
+        forwarded_args.push(OsString::from(if use_hyperlinks {
+            "--hyperlink=always"
+        } else {
+            "--hyperlink=never"
+        }));
 
         let output = Command::new(exe)
             .args(&forwarded_args)
@@ -584,7 +653,10 @@ fn main() {
             }
         };
 
-        let depths: Vec<Option<usize>> = reversed_plain.iter().map(|line| parse_depth(line)).collect();
+        let depths: Vec<Option<usize>> = reversed_plain
+            .iter()
+            .map(|line| parse_depth(line))
+            .collect();
         // Reverse style: child groups use top+middle connectors only.
         // Flip every terminating connector to a top connector first.
         for line in &mut reversed {
@@ -636,10 +708,15 @@ fn main() {
         .build_global();
 
     let lscolors = LsColors::from_env().unwrap_or_default();
-    let use_hyperlinks = args.hyperlink;
 
-    let root_path = args.path.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let root_abs = root_path.canonicalize().unwrap_or_else(|_| root_path.clone());
+    let root_path = args
+        .path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root_abs = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
     let need_metadata = metadata_required(&args);
     let use_shallow_size_path = use_shallow_size_fast_path(&args);
 
@@ -682,7 +759,7 @@ fn main() {
         None
     };
     let root_file_type = root_abs.symlink_metadata().ok().map(|m| m.file_type());
-    
+
     // PHASE 2: In-Memory Tree Build (Zero Disk IO)
     let root_node = build_tree_from_cache(
         &root_abs,
@@ -743,12 +820,20 @@ fn main() {
             write!(out, "{:width$}", "", width = count_layout.pair_width() + 1)?;
         }
         if args.sizes {
-            let root_size = root_node
-                .as_ref()
-                .map(|n| n.true_size)
-                .unwrap_or(0);
+            let root_size = root_node.as_ref().map(|n| n.true_size).unwrap_or(0);
             let size_str = format_size(root_size);
-            write!(out, "{}{:>width$}{} ", "\x1b[1;36m", size_str, "\x1b[0m", width = SIZE_COL_WIDTH)?;
+            if use_colors {
+                write!(
+                    out,
+                    "{}{:>width$}{} ",
+                    "\x1b[1;36m",
+                    size_str,
+                    "\x1b[0m",
+                    width = SIZE_COL_WIDTH
+                )?;
+            } else {
+                write!(out, "{:>width$} ", size_str, width = SIZE_COL_WIDTH)?;
+            }
         }
         if args.times {
             write!(out, "{:>17}", "")?;
@@ -768,6 +853,7 @@ fn main() {
             &args,
             &lscolors,
             use_hyperlinks,
+            use_colors,
             count_layout,
             &mut shown_dir_paths,
             &mut shown_file_paths,
@@ -1067,7 +1153,7 @@ fn perform_unified_scan(
                 } else {
                     local_dir_count += 1;
                 }
-                
+
                 if let Some(ref mut stubs_vec) = stubs {
                     stubs_vec.push(EntryStub {
                         name: entry_res.file_name.to_string_lossy().into_owned(),
@@ -1122,19 +1208,21 @@ fn perform_unified_scan(
         } else {
             HashMap::with_hasher(FxBuildHasher::default())
         };
-    let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> = if let Some(ddc) = dir_local_dir_counts {
-        match Arc::try_unwrap(ddc) {
-            Ok(map) => map.into_iter().collect(),
-            Err(map) => map
-                .iter()
-                .map(|entry| (entry.key().clone(), *entry.value()))
-                .collect(),
-        }
-    } else {
-        HashMap::with_hasher(FxBuildHasher::default())
-    };
+    let mut true_dir_counts: HashMap<PathBuf, u64, FxBuildHasher> =
+        if let Some(ddc) = dir_local_dir_counts {
+            match Arc::try_unwrap(ddc) {
+                Ok(map) => map.into_iter().collect(),
+                Err(map) => map
+                    .iter()
+                    .map(|entry| (entry.key().clone(), *entry.value()))
+                    .collect(),
+            }
+        } else {
+            HashMap::with_hasher(FxBuildHasher::default())
+        };
 
-    let mut path_set: HashSet<PathBuf, FxBuildHasher> = HashSet::with_hasher(FxBuildHasher::default());
+    let mut path_set: HashSet<PathBuf, FxBuildHasher> =
+        HashSet::with_hasher(FxBuildHasher::default());
     path_set.extend(true_sizes.keys().cloned());
     path_set.extend(true_file_counts.keys().cloned());
     path_set.extend(true_dir_counts.keys().cloned());
@@ -1193,7 +1281,8 @@ fn build_tree_from_cache(
         .map(|m| m.is_dir())
         .or_else(|| file_type.map(|ft| ft.is_dir()))
         .unwrap_or(false);
-    let is_symlink = is_symlink_hint.unwrap_or_else(|| file_type.map(|ft| ft.is_symlink()).unwrap_or(false));
+    let is_symlink =
+        is_symlink_hint.unwrap_or_else(|| file_type.map(|ft| ft.is_symlink()).unwrap_or(false));
 
     let true_size = if args.sizes && is_dir {
         scan.true_sizes.get(path).map(|v| *v).unwrap_or(0)
@@ -1217,7 +1306,10 @@ fn build_tree_from_cache(
 
     let mut node = Node {
         path: path.to_path_buf(),
-        name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string()),
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string()),
         metadata,
         children: Vec::new(),
         total_children_count: 0,
@@ -1233,10 +1325,7 @@ fn build_tree_from_cache(
         recursive_file_count,
     };
 
-    let is_git_dir = path
-        .file_name()
-        .map(|name| name == ".git")
-        .unwrap_or(false);
+    let is_git_dir = path.file_name().map(|name| name == ".git").unwrap_or(false);
 
     if is_dir && depth < args.max_depth && !(no_expand_git && is_git_dir) {
         if let Some(stubs) = scan.dir_children.get(path) {
@@ -1320,7 +1409,11 @@ fn build_tree_from_cache(
             } else {
                 0
             };
-            let limit = if depth == 0 { entries.len() } else { entries.len().min(args.trunc) };
+            let limit = if depth == 0 {
+                entries.len()
+            } else {
+                entries.len().min(args.trunc)
+            };
             let omitted_dirs_from_trunc = entries
                 .iter()
                 .skip(limit)
@@ -1350,7 +1443,10 @@ fn build_tree_from_cache(
                         if stub.file_type.is_dir() {
                             scan.true_sizes.get(&stub.path).copied().unwrap_or(0)
                         } else {
-                            stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0)
+                            stub.metadata
+                                .as_ref()
+                                .map(|m| m.blocks() * 512)
+                                .unwrap_or(0)
                         }
                     })
                     .sum();
@@ -1360,7 +1456,12 @@ fn build_tree_from_cache(
                     stubs
                         .iter()
                         .filter(|stub| !stub.file_type.is_dir())
-                        .map(|stub| stub.metadata.as_ref().map(|m| m.blocks() * 512).unwrap_or(0))
+                        .map(|stub| {
+                            stub.metadata
+                                .as_ref()
+                                .map(|m| m.blocks() * 512)
+                                .unwrap_or(0)
+                        })
                         .sum()
                 };
                 truncated_size + filtered_size
@@ -1428,6 +1529,7 @@ fn print_node(
     args: &Args,
     lscolors: &LsColors,
     use_hyperlinks: bool,
+    use_colors: bool,
     count_layout: CountColumnLayout,
     shown_dir_paths: &mut Vec<PathBuf>,
     shown_file_paths: &mut Vec<PathBuf>,
@@ -1437,20 +1539,35 @@ fn print_node(
 
     for (i, child) in node.children.iter().enumerate() {
         let is_last = i == child_count - 1 && total_count <= child_count;
-        
-        let color_reset = "\x1b[0m";
-        let size_color = "\x1b[1;36m";
-        let date_color = "\x1b[37m";
 
         if args.sizes {
             let display_size = child.true_size;
             let size_str = format_size(display_size);
-            write!(out, "{}{:>width$}{} ", size_color, size_str, color_reset, width = SIZE_COL_WIDTH)?;
+            if use_colors {
+                write!(
+                    out,
+                    "{}{:>width$}{} ",
+                    "\x1b[1;36m",
+                    size_str,
+                    "\x1b[0m",
+                    width = SIZE_COL_WIDTH
+                )?;
+            } else {
+                write!(out, "{:>width$} ", size_str, width = SIZE_COL_WIDTH)?;
+            }
         }
 
         if args.times {
-            let time_str = child.metadata.as_ref().map(|m| format_time(m)).unwrap_or_else(|| "-".to_string());
-            write!(out, "{}{:>16}{} ", date_color, time_str, color_reset)?;
+            let time_str = child
+                .metadata
+                .as_ref()
+                .map(|m| format_time(m))
+                .unwrap_or_else(|| "-".to_string());
+            if use_colors {
+                write!(out, "{}{:>16}{} ", "\x1b[37m", time_str, "\x1b[0m")?;
+            } else {
+                write!(out, "{:>16} ", time_str)?;
+            }
         }
 
         if args.counts {
@@ -1459,6 +1576,7 @@ fn print_node(
                 child.recursive_dir_count,
                 child.recursive_file_count,
                 count_layout,
+                use_colors,
             )?;
         }
 
@@ -1485,23 +1603,6 @@ fn print_node(
                 .map(|md| md.permissions().mode() & 0o111 != 0)
                 .unwrap_or_else(|| is_executable_path(&child.path));
 
-        // Styling
-        let style = if child.is_symlink {
-            lscolors.style_for_path(&child.path)
-        } else if child.is_dir {
-            if let Some(m) = child.metadata.as_ref() {
-                lscolors.style_for_path_with_metadata(&child.path, Some(m))
-            } else {
-                lscolors.style_for_path(&child.path)
-            }
-        } else {
-            // For regular files (including executables), prefer suffix mapping first.
-            lscolors
-                .style_for_str(&child.name)
-                .or_else(|| lscolors.style_for_indicator(lscolors::Indicator::RegularFile))
-        };
-        let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();
-
         let mut display_name = child.name.clone();
         if args.classify {
             if child.is_symlink {
@@ -1515,11 +1616,31 @@ fn print_node(
             }
         }
 
-        let is_extensionless_exec = is_exec_file && child.path.extension().is_none();
-        let colored_name = if is_extensionless_exec {
-            format!("\x1b[38;2;0;245;200m{}\x1b[0m", display_name)
+        let colored_name = if use_colors {
+            // Styling
+            let style = if child.is_symlink {
+                lscolors.style_for_path(&child.path)
+            } else if child.is_dir {
+                if let Some(m) = child.metadata.as_ref() {
+                    lscolors.style_for_path_with_metadata(&child.path, Some(m))
+                } else {
+                    lscolors.style_for_path(&child.path)
+                }
+            } else {
+                // For regular files (including executables), prefer suffix mapping first.
+                lscolors
+                    .style_for_str(&child.name)
+                    .or_else(|| lscolors.style_for_indicator(lscolors::Indicator::RegularFile))
+            };
+            let ansi_style = style.map(|s| s.to_nu_ansi_term_style()).unwrap_or_default();
+            let is_extensionless_exec = is_exec_file && child.path.extension().is_none();
+            if is_extensionless_exec {
+                format!("\x1b[38;2;0;245;200m{}\x1b[0m", display_name)
+            } else {
+                ansi_style.paint(&display_name).to_string()
+            }
         } else {
-            ansi_style.paint(&display_name).to_string()
+            display_name
         };
 
         if use_hyperlinks {
@@ -1555,18 +1676,29 @@ fn print_node(
                 args,
                 lscolors,
                 use_hyperlinks,
+                use_colors,
                 count_layout,
                 shown_dir_paths,
                 shown_file_paths,
             )?;
         }
-
     }
 
     if total_count > child_count && !args.hide_more_count {
         if args.sizes {
             let omitted_size_str = format_size(node.omitted_size);
-            write!(out, "{}{:>width$}{} ", "\x1b[1;36m", omitted_size_str, "\x1b[0m", width = SIZE_COL_WIDTH)?;
+            if use_colors {
+                write!(
+                    out,
+                    "{}{:>width$}{} ",
+                    "\x1b[1;36m",
+                    omitted_size_str,
+                    "\x1b[0m",
+                    width = SIZE_COL_WIDTH
+                )?;
+            } else {
+                write!(out, "{:>width$} ", omitted_size_str, width = SIZE_COL_WIDTH)?;
+            }
         }
         if args.times {
             write!(out, "{:>16} ", "")?;
@@ -1577,6 +1709,7 @@ fn print_node(
                 node.omitted_recursive_dir_count,
                 node.omitted_recursive_file_count,
                 count_layout,
+                use_colors,
             )?;
         }
         for &last in prefixes {
@@ -1588,11 +1721,19 @@ fn print_node(
         }
         let mut omitted_parts = Vec::new();
         if node.omitted_dirs_count > 0 {
-            let suffix = if node.omitted_dirs_count == 1 { "dir" } else { "dirs" };
+            let suffix = if node.omitted_dirs_count == 1 {
+                "dir"
+            } else {
+                "dirs"
+            };
             omitted_parts.push(format!("{} more {}", node.omitted_dirs_count, suffix));
         }
         if node.omitted_files_count > 0 {
-            let suffix = if node.omitted_files_count == 1 { "file" } else { "files" };
+            let suffix = if node.omitted_files_count == 1 {
+                "file"
+            } else {
+                "files"
+            };
             omitted_parts.push(format!("{} more {}", node.omitted_files_count, suffix));
         }
         if omitted_parts.is_empty() {
